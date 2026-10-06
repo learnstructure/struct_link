@@ -1,0 +1,39 @@
+; CSI SAP2000 Text File
+TABLE:  "PROGRAM INFORMATION"
+   ProgramName=SAP2000   Version=24.0.0   ProgLevel=Ultimate
+
+TABLE:  "JOINT COORDINATES"
+   Joint=1   CoordSys=GLOBAL   CoordType=Cartesian   XorR=0   Y=0   Z=0   SpecialJt=No
+   Joint=2   CoordSys=GLOBAL   CoordType=Cartesian   XorR=5   Y=0   Z=0   SpecialJt=No
+   Joint=3   CoordSys=GLOBAL   CoordType=Cartesian   XorR=0   Y=0   Z=3   SpecialJt=No
+   Joint=4   CoordSys=GLOBAL   CoordType=Cartesian   XorR=5   Y=0   Z=3   SpecialJt=No
+
+TABLE:  "JOINT RESTRAINTS"
+   Joint=1   U1=Yes   U2=Yes   U3=Yes   R1=Yes   R2=Yes   R3=Yes
+   Joint=2   U1=Yes   U2=Yes   U3=Yes   R1=Yes   R2=Yes   R3=Yes
+
+TABLE:  "MATERIAL PROPERTIES 02 - BASIC MECHANICAL PROPERTIES"
+   Material=CONC   UnitMass=2400   UnitWeight=23544   E1=25000000   U12=0.2   A1=0   G12=10416666
+
+TABLE:  "FRAME SECTION PROPERTIES 01 - GENERAL"
+   SectionName=COL   Material=CONC   Shape=Rectangular   t3=0.4   t2=0.4   Area=0.16
+   SectionName=BEAM   Material=CONC   Shape=Rectangular   t3=0.5   t2=0.3   Area=0.15
+
+TABLE:  "CONNECTIVITY - FRAME"
+   Frame=C1   JointI=1   JointJ=3   IsCurved=No
+   Frame=C2   JointI=2   JointJ=4   IsCurved=No
+   Frame=B1   JointI=3   JointJ=4   IsCurved=No
+
+TABLE:  "FRAME SECTION ASSIGNMENTS"
+   Frame=C1   SectionName=COL   AutoSelect=N.A.
+   Frame=C2   SectionName=COL   AutoSelect=N.A.
+   Frame=B1   SectionName=BEAM   AutoSelect=N.A.
+
+TABLE:  "JOINT LOADS - FORCE"
+   Joint=3   LoadPat=DEAD   CoordSys=GLOBAL   Type=Force   F1=0   F2=0   F3=-25   M1=0   M2=0   M3=0
+   Joint=4   LoadPat=DEAD   CoordSys=GLOBAL   Type=Force   F1=0   F2=0   F3=-25   M1=0   M2=0   M3=0
+
+TABLE:  "FRAME LOADS - DISTRIBUTED"
+   Frame=B1   LoadPat=DEAD   CoordSys=GLOBAL   Type=Force   Dir=Gravity   DistType=RelDist   RelDistA=0   RelDistB=1   FValA=18   FValB=18
+
+END TABLE DATA

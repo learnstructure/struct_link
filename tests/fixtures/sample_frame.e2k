@@ -1,0 +1,31 @@
+; CSI ETABS Text File
+TABLE:  "PROGRAM INFORMATION"
+   ProgramName=ETABS   Version=21.0.0   ProgLevel=Ultimate
+
+TABLE:  "POINT COORDINATES"
+   Point=1   X=0   Y=0   Z=0
+   Point=2   X=6   Y=0   Z=0
+   Point=3   X=0   Y=0   Z=3.5
+   Point=4   X=6   Y=0   Z=3.5
+
+TABLE:  "POINT ASSIGNMENTS - RESTRAINTS"
+   Point=1   UX=Yes   UY=Yes   UZ=Yes   RX=Yes   RY=Yes   RZ=Yes
+   Point=2   UX=Yes   UY=Yes   UZ=Yes   RX=Yes   RY=Yes   RZ=Yes
+
+TABLE:  "MATERIAL PROPERTIES - GENERAL"
+   Material=C30   Type=Concrete   E=30000000   Nu=0.2   UnitMass=2500
+
+TABLE:  "FRAME SECTION PROPERTIES"
+   SectionName=COL   Shape=Rectangular   t3=0.45   t2=0.45   Area=0.2025
+   SectionName=BEAM   Shape=Rectangular   t3=0.55   t2=0.3   Area=0.165
+
+TABLE:  "LINE CONNECTIVITY"
+   Line=C1   PointI=1   PointJ=3   SectionName=COL
+   Line=C2   PointI=2   PointJ=4   SectionName=COL
+   Line=B1   PointI=3   PointJ=4   SectionName=BEAM
+
+TABLE:  "POINT LOADS - FORCE"
+   Point=3   LoadPat=DEAD   FX=0   FY=0   FZ=-30   MX=0   MY=0   MZ=0
+   Point=4   LoadPat=DEAD   FX=0   FY=0   FZ=-30   MX=0   MY=0   MZ=0
+
+END TABLE DATA

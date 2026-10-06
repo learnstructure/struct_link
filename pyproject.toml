@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "struct_link"
+version = "0.1.0"
+description = "Commercial CAE/FEM interoperability link (SAP2000, ETABS, etc.) for the Structural Engineering Ecosystem"
+readme = "README.md"
+authors = [{ name = "Abinash Mandal", email = "abinashmandal@nevada.unr.edu" }]
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "struct_core>=0.1.0",
+    "pydantic>=2.0.0",
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+com = [
+    "comtypes>=1.2.0; platform_system == 'Windows'",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["struct_link*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
