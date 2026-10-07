@@ -26,6 +26,10 @@ htmlcov/
 *.swp
 *.swo
 *.log
+*.pdf
 scratch/
 reference/
 references/
+output/
+examples/output/
+

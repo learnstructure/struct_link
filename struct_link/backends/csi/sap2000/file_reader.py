@@ -18,6 +18,7 @@ from struct_core import (
     LoadCase,
     Node,
     PointLoad,
+    Project,
     RectangularSection,
     StructuralModel,
     Support,
@@ -33,6 +34,31 @@ class Sap2000FileReader(BaseModelReader):
     def read_model(self, source: Union[str, Path]) -> StructuralModel:
         tables = S2kParser.parse_file(source)
         return self._build_model(tables)
+
+    def read_project(self, source: Union[str, Path], title: Optional[str] = None) -> Project:
+        tables = S2kParser.parse_file(source)
+        model = self._build_model(tables)
+        project = Project(model=model)
+        if title:
+            project.metadata.title = title
+        elif hasattr(source, "stem"):
+            project.metadata.title = source.stem
+        else:
+            project.metadata.title = Path(source).stem
+
+        # Extract units from PROGRAM CONTROL if defined
+        prog_table = tables.get("PROGRAM CONTROL") or tables.get("PROGRAM INFORMATION")
+        if prog_table and prog_table.rows:
+            curr_units = prog_table.rows[0].get("CurrUnits")
+            if curr_units and isinstance(curr_units, str):
+                try:
+                    from struct_core import parse_units
+
+                    project.metadata.units = parse_units(curr_units)
+                except Exception:
+                    pass
+
+        return project
 
     def _build_model(self, tables: Dict[str, S2kTable]) -> StructuralModel:
         nodes: List[Node] = []
@@ -56,26 +82,38 @@ class Sap2000FileReader(BaseModelReader):
                 nodes.append(Node(id=jid, x=x, y=y, z=z))
 
         # 2. Joint Restraints -> Supports
-        # Table: "JOINT RESTRAINTS"
-        restr_table = tables.get("JOINT RESTRAINTS")
+        # Table: "JOINT RESTRAINT ASSIGNMENTS" or "JOINT RESTRAINTS"
+        restr_table = tables.get("JOINT RESTRAINT ASSIGNMENTS") or tables.get("JOINT RESTRAINTS")
         if restr_table:
             for row in restr_table.rows:
-                jid = str(row.get("Joint", ""))
+                jid = str(row.get("Joint", row.get("JointID", "")))
                 if not jid:
                     continue
                 supports.append(
                     Support(
                         node_id=jid,
-                        ux=bool(row.get("U1", False)),
-                        uy=bool(row.get("U2", False)),
-                        uz=bool(row.get("U3", False)),
-                        rx=bool(row.get("R1", False)),
-                        ry=bool(row.get("R2", False)),
-                        rz=bool(row.get("R3", False)),
+                        ux=bool(row.get("U1", row.get("UX", False))),
+                        uy=bool(row.get("U2", row.get("UY", False))),
+                        uz=bool(row.get("U3", row.get("UZ", False))),
+                        rx=bool(row.get("R1", row.get("RX", False))),
+                        ry=bool(row.get("R2", row.get("RY", False))),
+                        rz=bool(row.get("R3", row.get("RZ", False))),
                     )
                 )
 
         # 3. Materials
+        # Table: "MATERIAL PROPERTIES 01 - GENERAL" (types, symmetry)
+        mat_info: Dict[str, Dict[str, str]] = {}
+        mat_gen_table = tables.get("MATERIAL PROPERTIES 01 - GENERAL")
+        if mat_gen_table:
+            for row in mat_gen_table.rows:
+                mid = str(row.get("Material", ""))
+                if mid:
+                    mat_info[mid] = {
+                        "type": str(row.get("Type", "")),
+                        "sym_type": str(row.get("SymType", "")),
+                    }
+
         # Table: "MATERIAL PROPERTIES 02 - BASIC MECHANICAL PROPERTIES" or "MATERIAL PROPERTIES"
         mat_table = tables.get("MATERIAL PROPERTIES 02 - BASIC MECHANICAL PROPERTIES") or tables.get("MATERIAL PROPERTIES")
         if mat_table:
@@ -86,7 +124,14 @@ class Sap2000FileReader(BaseModelReader):
                 E = float(row.get("E1", row.get("E", 2.9e7)))
                 nu = float(row.get("U12", row.get("Nu", 0.3)))
                 rho = float(row.get("UnitMass", row.get("MassDensity", 0.0)))
-                materials.append(ElasticMaterial(id=mid, E=E, nu=nu, rho=rho))
+                unit_weight = None
+                if "UnitWeight" in row and row["UnitWeight"] is not None:
+                    try:
+                        unit_weight = float(row["UnitWeight"])
+                    except (ValueError, TypeError):
+                        pass
+                m_type = mat_info.get(mid, {}).get("type")
+                materials.append(ElasticMaterial(id=mid, name=m_type, E=E, nu=nu, rho=rho, unit_weight=unit_weight))
 
         if not materials:
             # Fallback default material if not in file
@@ -94,12 +139,17 @@ class Sap2000FileReader(BaseModelReader):
 
         # 4. Frame Sections
         # Table: "FRAME SECTION PROPERTIES 01 - GENERAL" or "FRAME SECTIONS"
+        sec_mat_map: Dict[str, str] = {}
         sec_table = tables.get("FRAME SECTION PROPERTIES 01 - GENERAL") or tables.get("FRAME SECTIONS")
         if sec_table:
             for row in sec_table.rows:
                 sname = str(row.get("SectionName", row.get("Section", "")))
                 if not sname:
                     continue
+                mat_name = str(row.get("Material", row.get("MatName", "")))
+                if mat_name:
+                    sec_mat_map[sname] = mat_name
+
                 shape = str(row.get("Shape", "")).upper()
                 t3 = float(row.get("t3", row.get("Depth", 0.0)))
                 t2 = float(row.get("t2", row.get("Width", 0.0)))
@@ -126,7 +176,7 @@ class Sap2000FileReader(BaseModelReader):
         if not sections:
             sections.append(RectangularSection(id="DEFAULT_SEC", b=0.4, h=0.4))
 
-        # Check for section assignments if separated: "FRAME SECTION ASSIGNMENTS"
+        # Check for section assignments: "FRAME SECTION ASSIGNMENTS"
         frame_sec_map: Dict[str, str] = {}
         sec_assign_table = tables.get("FRAME SECTION ASSIGNMENTS")
         if sec_assign_table:
@@ -141,6 +191,7 @@ class Sap2000FileReader(BaseModelReader):
         conn_table = tables.get("CONNECTIVITY - FRAME")
         default_mat_id = materials[0].id
         default_sec_id = sections[0].id
+        valid_mat_ids = {m.id for m in materials}
 
         if conn_table:
             for row in conn_table.rows:
@@ -150,17 +201,30 @@ class Sap2000FileReader(BaseModelReader):
                 if not fid or not ji or not jj:
                     continue
                 sec_id = frame_sec_map.get(fid, default_sec_id)
+                mat_id = sec_mat_map.get(sec_id, default_mat_id)
+                if mat_id not in valid_mat_ids:
+                    mat_id = default_mat_id
                 elements.append(
                     BeamElement(
                         id=fid,
                         start_node=ji,
                         end_node=jj,
-                        material_id=default_mat_id,
+                        material_id=mat_id,
                         section_id=sec_id,
                     )
                 )
 
-        # 6. Joint Loads -> LoadCases with PointLoads
+        # 6. Load Patterns
+        # Table: "LOAD PATTERN DEFINITIONS" or "LOAD CASE DEFINITIONS"
+        pat_table = tables.get("LOAD PATTERN DEFINITIONS") or tables.get("LOAD CASE DEFINITIONS")
+        if pat_table:
+            for row in pat_table.rows:
+                pat = str(row.get("LoadPat", row.get("Case", row.get("LoadCase", ""))))
+                if pat and pat not in load_cases_dict:
+                    self_wt = float(row.get("SelfWtMult", 0.0)) > 0.0
+                    load_cases_dict[pat] = LoadCase(id=pat, include_self_weight=self_wt)
+
+        # 7. Joint Loads -> LoadCases with PointLoads
         # Table: "JOINT LOADS - FORCE"
         jt_loads_table = tables.get("JOINT LOADS - FORCE")
         if jt_loads_table:
@@ -189,7 +253,7 @@ class Sap2000FileReader(BaseModelReader):
                     )
                 )
 
-        # 7. Frame Loads -> DistributedLoads
+        # 8. Frame Loads -> DistributedLoads
         # Table: "FRAME LOADS - DISTRIBUTED"
         frm_loads_table = tables.get("FRAME LOADS - DISTRIBUTED")
         if frm_loads_table:
@@ -199,25 +263,126 @@ class Sap2000FileReader(BaseModelReader):
                 if pat not in load_cases_dict:
                     load_cases_dict[pat] = LoadCase(id=pat)
 
-                dir_name = str(row.get("Dir", row.get("Direction", "Gravity"))).upper()
-                val = float(row.get("FVal", row.get("Val1", row.get("F1", 0.0))))
+                # Extract load magnitude at ends A and B (SAP2000 uses FOverLA/FOverLB)
+                val_a = None
+                for k in ("FOverLA", "FValA", "FVal", "Val1", "F1", "MOverLA", "MValA", "MVal"):
+                    if k in row and row[k] is not None:
+                        try:
+                            val_a = float(row[k])
+                            break
+                        except (ValueError, TypeError):
+                            pass
 
-                # Map direction
+                val_b = None
+                for k in ("FOverLB", "FValB", "FVal", "Val2", "F2", "MOverLB", "MValB", "MVal"):
+                    if k in row and row[k] is not None:
+                        try:
+                            val_b = float(row[k])
+                            break
+                        except (ValueError, TypeError):
+                            pass
+
+                if val_a is None and val_b is None:
+                    val_a = 0.0
+                    val_b = 0.0
+                elif val_a is None:
+                    val_a = val_b
+                elif val_b is None:
+                    val_b = val_a
+
+                avg_val = (val_a + val_b) / 2.0
+                dir_name = str(row.get("Dir", row.get("Direction", "Gravity"))).strip().upper()
+                csys = str(row.get("CoordSys", "GLOBAL")).strip().upper()
+
+                # Map direction to global or local components
                 wx, wy, wz = 0.0, 0.0, 0.0
-                if "GRAV" in dir_name or dir_name in ("Z", "3", "-Z"):
-                    wz = -abs(val) if "GRAV" in dir_name else val
-                elif dir_name in ("Y", "2"):
-                    wy = val
-                elif dir_name in ("X", "1"):
-                    wx = val
+                w1, w2, w3 = 0.0, 0.0, 0.0
+                is_local = False
+                w_start: Optional[float] = None
+                w_end: Optional[float] = None
+
+                if "GRAV" in dir_name:
+                    # SAP2000 Gravity acts downward along -Z
+                    wz = -abs(avg_val)
+                    w_start = -abs(val_a)
+                    w_end = -abs(val_b)
+                elif dir_name in ("Z", "+Z"):
+                    wz = avg_val
+                    w_start = val_a
+                    w_end = val_b
+                elif dir_name in ("-Z",):
+                    wz = -avg_val
+                    w_start = -val_a
+                    w_end = -val_b
+                elif dir_name in ("Y", "+Y"):
+                    wy = avg_val
+                    w_start = val_a
+                    w_end = val_b
+                elif dir_name in ("-Y",):
+                    wy = -avg_val
+                    w_start = -val_a
+                    w_end = -val_b
+                elif dir_name in ("X", "+X"):
+                    wx = avg_val
+                    w_start = val_a
+                    w_end = val_b
+                elif dir_name in ("-X",):
+                    wx = -avg_val
+                    w_start = -val_a
+                    w_end = -val_b
+                elif dir_name in ("1", "+1") or (csys == "LOCAL" and dir_name in ("X", "+X")):
+                    is_local = True
+                    w1 = avg_val
+                    w_start = val_a
+                    w_end = val_b
+                elif dir_name in ("-1",) or (csys == "LOCAL" and dir_name in ("-X",)):
+                    is_local = True
+                    w1 = -avg_val
+                    w_start = -val_a
+                    w_end = -val_b
+                elif dir_name in ("2", "+2") or (csys == "LOCAL" and dir_name in ("Y", "+Y")):
+                    is_local = True
+                    w2 = avg_val
+                    w_start = val_a
+                    w_end = val_b
+                elif dir_name in ("-2",) or (csys == "LOCAL" and dir_name in ("-Y",)):
+                    is_local = True
+                    w2 = -avg_val
+                    w_start = -val_a
+                    w_end = -val_b
+                elif dir_name in ("3", "+3") or (csys == "LOCAL" and dir_name in ("Z", "+Z")):
+                    is_local = True
+                    w3 = avg_val
+                    w_start = val_a
+                    w_end = val_b
+                elif dir_name in ("-3",) or (csys == "LOCAL" and dir_name in ("-Z",)):
+                    is_local = True
+                    w3 = -avg_val
+                    w_start = -val_a
+                    w_end = -val_b
+                else:
+                    # Fallback default: assume gravity downward (-Z)
+                    wz = -abs(avg_val)
+                    w_start = -abs(val_a)
+                    w_end = -abs(val_b)
+
+                load_kwargs = {
+                    "element_id": fid,
+                    "wx": wx,
+                    "wy": wy,
+                    "wz": wz,
+                    "is_local": is_local,
+                }
+                if is_local:
+                    load_kwargs["w1"] = w1
+                    load_kwargs["w2"] = w2
+                    load_kwargs["w3"] = w3
+                if val_a != val_b:
+                    load_kwargs["w_start"] = w_start
+                    load_kwargs["w_end"] = w_end
 
                 load_cases_dict[pat].element_loads.append(
-                    DistributedLoad(
-                        element_id=fid,
-                        wx=wx,
-                        wy=wy,
-                        wz=wz,
-                    )
+                    DistributedLoad(**load_kwargs)
                 )
 
         return StructuralModel(

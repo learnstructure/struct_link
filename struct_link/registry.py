@@ -91,6 +91,21 @@ def read_model(source: Union[str, Path], software: Optional[str] = None) -> Stru
     return reader.read_model(path)
 
 
+def read_project(
+    source: Union[str, Path],
+    software: Optional[str] = None,
+    title: Optional[str] = None,
+) -> Project:
+    """
+    Import a Project from a commercial software file.
+    Auto-detects software from file extension if not provided.
+    """
+    path = Path(source)
+    backend_key = software if software else path.suffix.lower()
+    reader = get_reader(backend_key)
+    return reader.read_project(path, title=title)
+
+
 def write_model(
     model_or_project: Union[StructuralModel, Project],
     target_path: Union[str, Path],
@@ -104,3 +119,4 @@ def write_model(
     backend_key = software if software else path.suffix.lower()
     writer = get_writer(backend_key)
     return writer.write_model(model_or_project, path)
+

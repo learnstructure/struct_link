@@ -193,3 +193,53 @@ def test_fixture_files():
     assert len(m_etabs.elements) == 3
     assert len(m_etabs.supports) == 2
 
+
+def test_sap2000_reference_frame_import_and_roundtrip(tmp_path):
+    ref_path = Path(__file__).parent.parent / "references" / "sap2000" / "frame.s2k"
+    assert ref_path.exists(), f"Reference file missing: {ref_path}"
+
+    from struct_core import validate_structural_model
+    from struct_link import read_project
+
+    project = read_project(ref_path)
+    model = project.model
+
+    # Verify structural topology
+    assert len(model.nodes) == 36
+    assert len(model.elements) == 58
+    assert len(model.supports) == 12
+    assert len(model.sections) == 2
+    assert len(model.materials) == 4
+    assert len(model.load_cases) == 2
+
+    # Verify imported loads
+    dead_case = next(lc for lc in model.load_cases if lc.id == "DEAD")
+    live_case = next(lc for lc in model.load_cases if lc.id == "Live")
+    assert len(dead_case.element_loads) == 34
+    assert len(live_case.element_loads) == 34
+    assert abs(dead_case.element_loads[0].wz - (-0.05710146660845614)) < 1e-6
+    assert abs(live_case.element_loads[0].wz - (-0.06852175993014738)) < 1e-6
+
+    # Verify units
+    assert project.metadata.units.force == "kip"
+    assert project.metadata.units.length == "in"
+
+    # Verify model validation passes
+    errors = validate_structural_model(model, raise_error=False)
+    assert errors == []
+
+    # Verify roundtrip export & re-import
+    out_file = tmp_path / "roundtrip_frame.s2k"
+    write_model(project, out_file)
+    assert out_file.exists()
+
+    re_imported = read_model(out_file)
+    assert len(re_imported.nodes) == 36
+    assert len(re_imported.elements) == 58
+    assert len(re_imported.supports) == 12
+    assert len(re_imported.sections) == 2
+    assert len(re_imported.load_cases) == 2
+    errors_rt = validate_structural_model(re_imported, raise_error=False)
+    assert errors_rt == []
+
+

@@ -22,6 +22,7 @@ from .registry import (
     get_reader,
     get_writer,
     read_model,
+    read_project,
     write_model,
 )
 
@@ -43,5 +44,6 @@ __all__ = [
     "get_writer",
     "get_live_session",
     "read_model",
+    "read_project",
     "write_model",
 ]

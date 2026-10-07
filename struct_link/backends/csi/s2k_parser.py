@@ -48,7 +48,13 @@ class S2kParser:
         tables: Dict[str, S2kTable] = {}
         current_table: Optional[S2kTable] = None
 
-        for line in content.splitlines():
+        lines = content.splitlines()
+        idx = 0
+        total_lines = len(lines)
+
+        while idx < total_lines:
+            line = lines[idx]
+            idx += 1
             stripped = line.strip()
             if not stripped or stripped.startswith(";"):
                 continue
@@ -65,9 +71,17 @@ class S2kParser:
                 current_table = None
                 continue
 
+            # If inside a table, handle possible line continuations:
+            # A line ending with '_' continues on the next line(s)
+            logical_line = stripped
+            while logical_line.endswith("_") and idx < total_lines:
+                next_line = lines[idx].strip()
+                idx += 1
+                logical_line = logical_line[:-1].rstrip() + " " + next_line
+
             # If inside a table, parse key=value fields
             if current_table is not None:
-                matches = cls.KV_PAIR_RE.findall(stripped)
+                matches = cls.KV_PAIR_RE.findall(logical_line)
                 if matches:
                     row_data: Dict[str, Any] = {}
                     for key, quoted_val, unquoted_val in matches:
