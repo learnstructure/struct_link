@@ -184,6 +184,8 @@ class Sap2000FileWriter(BaseModelWriter):
                         "I33": i33,
                         "I22": i22,
                         "I23": 0.0,
+                        "AS2": (5.0 / 6.0) * area,
+                        "AS3": (5.0 / 6.0) * area,
                     }
                 )
             elif sec_type == "circular":
@@ -204,20 +206,27 @@ class Sap2000FileWriter(BaseModelWriter):
                         "I33": iz,
                         "I22": iz,
                         "I23": 0.0,
+                        "AS2": 0.9 * area,
+                        "AS3": 0.9 * area,
                     }
                 )
             else:
-                sec_rows.append(
-                    {
-                        "SectionName": str(sec.id),
-                        "Material": mat_id,
-                        "Shape": "General",
-                        "Area": float(getattr(sec, "A", 1.0)),
-                        "I33": float(getattr(sec, "Iz", 1.0)),
-                        "I22": float(getattr(sec, "Iy", 1.0)),
-                        "J": float(getattr(sec, "J", 1.0)),
-                    }
-                )
+                as2_val = getattr(sec, "As2", getattr(sec, "as2", getattr(sec, "Ay", getattr(sec, "AS2", 0.0))))
+                as3_val = getattr(sec, "As3", getattr(sec, "as3", getattr(sec, "Az", getattr(sec, "AS3", 0.0))))
+                gen_dict = {
+                    "SectionName": str(sec.id),
+                    "Material": mat_id,
+                    "Shape": "General",
+                    "Area": float(getattr(sec, "A", 1.0)),
+                    "I33": float(getattr(sec, "Iz", 1.0)),
+                    "I22": float(getattr(sec, "Iy", 1.0)),
+                    "J": float(getattr(sec, "J", 1.0)),
+                }
+                if as2_val:
+                    gen_dict["AS2"] = float(as2_val)
+                if as3_val:
+                    gen_dict["AS3"] = float(as3_val)
+                sec_rows.append(gen_dict)
 
         if not sec_rows:
             sec_rows.append(

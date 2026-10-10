@@ -126,9 +126,9 @@ class Sap2000LiveSession(BaseLiveSession):
                 except Exception:
                     pass
 
-    def run_analysis(self) -> AnalysisResult:
+    def run_analysis(self, case_name: Optional[str] = None) -> AnalysisResult:
         """
-        Trigger analysis in SAP2000 and return results.
+        Trigger analysis in SAP2000 and return results as struct_core.AnalysisResult.
         """
         if not self.is_connected():
             raise RuntimeError("No active SAP2000 session. Call connect() first.")
@@ -138,5 +138,70 @@ class Sap2000LiveSession(BaseLiveSession):
         if ret != 0:
             raise RuntimeError(f"SAP2000 RunAnalysis failed with code {ret}")
 
-        # Stub for extracting displacements and forces into struct_core.AnalysisResult
-        return AnalysisResult(analysis_case_id="SAP2000_LIVE")
+        return self.get_analysis_results(case_name=case_name or "DEAD")
+
+    def get_analysis_results(self, case_name: str = "DEAD") -> AnalysisResult:
+        """
+        Extract joint displacements and reactions from the solved SAP2000 model into AnalysisResult.
+        """
+        if not self.is_connected():
+            raise RuntimeError("No active SAP2000 session. Call connect() first.")
+
+        from struct_core.analysis_result import (
+            AnalysisResult,
+            NodeDisplacement,
+            NodeReaction,
+            NodeResult,
+        )
+
+        node_results = {}
+        try:
+            self._sap_model.Results.Setup.DeselectAllCasesAndCombosForOutput()
+            self._sap_model.Results.Setup.SetCaseSelectedForOutput(case_name)
+
+            # 1. Joint Displacements
+            res = self._sap_model.Results.JointDispl("ALL", 0)
+            if res and len(res) >= 14 and res[0] == 0:
+                n_res = res[2]
+                objs = res[3]
+                u1s, u2s, u3s = res[8], res[9], res[10]
+                r1s, r2s, r3s = res[11], res[12], res[13]
+                for i in range(n_res):
+                    nid = str(objs[i])
+                    if nid not in node_results:
+                        node_results[nid] = NodeResult(node_id=nid)
+                    node_results[nid].displacement = NodeDisplacement(
+                        ux=float(u1s[i]),
+                        uy=float(u2s[i]),
+                        uz=float(u3s[i]),
+                        rx=float(r1s[i]),
+                        ry=float(r2s[i]),
+                        rz=float(r3s[i]),
+                    )
+
+            # 2. Joint Reactions
+            res_r = self._sap_model.Results.JointReact("ALL", 0)
+            if res_r and len(res_r) >= 14 and res_r[0] == 0:
+                n_res = res_r[2]
+                objs = res_r[3]
+                f1s, f2s, f3s = res_r[8], res_r[9], res_r[10]
+                m1s, m2s, m3s = res_r[11], res_r[12], res_r[13]
+                for i in range(n_res):
+                    nid = str(objs[i])
+                    if nid not in node_results:
+                        node_results[nid] = NodeResult(node_id=nid)
+                    node_results[nid].reaction = NodeReaction(
+                        fx=float(f1s[i]),
+                        fy=float(f2s[i]),
+                        fz=float(f3s[i]),
+                        mx=float(m1s[i]),
+                        my=float(m2s[i]),
+                        mz=float(m3s[i]),
+                    )
+        except Exception:
+            pass
+
+        return AnalysisResult(
+            analysis_case_id=case_name,
+            node_results=node_results,
+        )

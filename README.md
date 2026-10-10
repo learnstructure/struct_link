@@ -77,10 +77,11 @@ Runnable example scripts are provided in [`examples/`](examples/):
 
 | Script | Description | Run Command |
 |---|---|---|
-| [`import_sap2000_model.py`](examples/import_sap2000_model.py) | Ingests SAP2000 reference model ([`frame.s2k`](references/sap2000/frame.s2k)), materializes self-weight via `struct_load.apply_self_weight`, saves the model in `struct_core` format (`frame_model.json`), converts to `fem3d.Structure`, and solves for 3D equilibrium reactions. | `python struct_link/examples/import_sap2000_model.py` |
+| [`import_sap2000_model.py`](examples/import_sap2000_model.py) | Ingests SAP2000 reference model ([`frame.s2k`](references/sap2000/frame.s2k)), preserves native self-weight and distributed loads, saves in `struct_core` format (`frame_model.json`), converts to `fem3d.Structure`, and solves for 3D equilibrium reactions with Timoshenko shear deformations considered. | `python struct_link/examples/import_sap2000_model.py` |
 | [`export_to_sap2000.py`](examples/export_to_sap2000.py) | Loads the `struct_core` model saved in `frame_model.json` and exports it to native CSI SAP2000 `.s2k` text format (`exported_3d_frame.s2k`). | `python struct_link/examples/export_to_sap2000.py` |
 | [`roundtrip_and_conversion.py`](examples/roundtrip_and_conversion.py) | Demonstrates cross-platform interoperability by converting `frame.s2k` to ETABS `.e2k`, re-importing, and roundtripping back to `.s2k`. | `python struct_link/examples/roundtrip_and_conversion.py` |
-| [`run_all.py`](examples/run_all.py) | Executes all three examples in sequence and verifies output. | `python struct_link/examples/run_all.py` |
+| [`run_full_building_pipeline.py`](examples/run_full_building_pipeline.py) | Flagship end-to-end integration: Ingests `frame.s2k`, detects native gravity loads, generates ASCE 7 seismic ELF lateral loads & combinations, solves 3D FEA in `fem3d`, designs beams/columns in `aci318` (biaxial P-M-M), and generates DXF drawings in `struct_draw`. | `python struct_link/examples/run_full_building_pipeline.py` |
+| [`run_all.py`](examples/run_all.py) | Executes all examples in sequence and verifies output. | `python struct_link/examples/run_all.py` |
 
 ### How to Import Exported Models into SAP2000:
 1. Open **CSI SAP2000** (v14 through v27+).

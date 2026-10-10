@@ -55,8 +55,11 @@ class Sap2000FileReader(BaseModelReader):
                     from struct_core import parse_units
 
                     project.metadata.units = parse_units(curr_units)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Could not parse SAP2000 CurrUnits '%s': %s", curr_units, exc
+                    )
 
         return project
 
@@ -134,8 +137,8 @@ class Sap2000FileReader(BaseModelReader):
                 materials.append(ElasticMaterial(id=mid, name=m_type, E=E, nu=nu, rho=rho, unit_weight=unit_weight))
 
         if not materials:
-            # Fallback default material if not in file
-            materials.append(ElasticMaterial(id="CONC", E=2.5e7, nu=0.2, rho=2400.0))
+            if tables.get("FRAME SECTION PROPERTIES 01 - GENERAL") or tables.get("FRAME SECTIONS") or tables.get("CONNECTIVITY - FRAME"):
+                raise ValueError("No materials defined in SAP2000 file.")
 
         # 4. Frame Sections
         # Table: "FRAME SECTION PROPERTIES 01 - GENERAL" or "FRAME SECTIONS"
@@ -158,6 +161,9 @@ class Sap2000FileReader(BaseModelReader):
                 I22 = float(row.get("I22", row.get("Iy", 0.0)))
                 J = float(row.get("J", 0.0))
 
+                as2 = float(row.get("AS2", row.get("As2", 0.0)))
+                as3 = float(row.get("AS3", row.get("As3", 0.0)))
+
                 if shape == "RECTANGULAR" or (t3 > 0 and t2 > 0 and shape in ("", "CONCRETE", "RECT")):
                     sections.append(RectangularSection(id=sname, b=t2, h=t3))
                 elif shape == "CIRCULAR" or (t3 > 0 and shape == "CIRCLE"):
@@ -170,6 +176,8 @@ class Sap2000FileReader(BaseModelReader):
                             Iz=I33 if I33 > 0 else 1.0,
                             Iy=I22 if I22 > 0 else 1.0,
                             J=J if J > 0 else 1.0,
+                            As2=as2 if as2 > 0 else None,
+                            As3=as3 if as3 > 0 else None,
                         )
                     )
 
@@ -361,10 +369,9 @@ class Sap2000FileReader(BaseModelReader):
                     w_start = -val_a
                     w_end = -val_b
                 else:
-                    # Fallback default: assume gravity downward (-Z)
-                    wz = -abs(avg_val)
-                    w_start = -abs(val_a)
-                    w_end = -abs(val_b)
+                    raise ValueError(
+                        f"Unsupported load direction '{dir_name}' (coordinate system '{csys}') in SAP2000 file."
+                    )
 
                 load_kwargs = {
                     "element_id": fid,
