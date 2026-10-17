@@ -16,10 +16,14 @@ from struct_core import (
     ElasticMaterial,
     GeneralSection,
     LoadCase,
+    MassSource,
+    MassSourceFactor,
+    ModalAnalysis,
     Node,
     PointLoad,
     Project,
     RectangularSection,
+    ResponseSpectrumAnalysis,
     StructuralModel,
     Support,
 )
@@ -54,7 +58,10 @@ class Sap2000FileReader(BaseModelReader):
                 try:
                     from struct_core import parse_units
 
-                    project.metadata.units = parse_units(curr_units)
+                    parsed_units = parse_units(curr_units)
+                    project.metadata.units = parsed_units
+                    if project.model:
+                        project.model.units = parsed_units
                 except Exception as exc:
                     import logging
                     logging.getLogger(__name__).warning(
@@ -201,6 +208,22 @@ class Sap2000FileReader(BaseModelReader):
         default_sec_id = sections[0].id
         valid_mat_ids = {m.id for m in materials}
 
+        # Parse Local Axes Assignments
+        # Table: "FRAME LOCAL AXES ASSIGNMENTS 1 - TYPICAL"
+        frame_angle_map: Dict[str, float] = {}
+        axes_table = tables.get("FRAME LOCAL AXES ASSIGNMENTS 1 - TYPICAL")
+        if axes_table:
+            for row in axes_table.rows:
+                fid = str(row.get("Frame", ""))
+                ang_val = row.get("Angle")
+                if fid and ang_val is not None:
+                    try:
+                        frame_angle_map[fid] = float(ang_val)
+                    except (ValueError, TypeError):
+                        pass
+
+        nodes_dict = {str(n.id): n for n in nodes}
+
         if conn_table:
             for row in conn_table.rows:
                 fid = str(row.get("Frame", row.get("FrameID", "")))
@@ -212,6 +235,28 @@ class Sap2000FileReader(BaseModelReader):
                 mat_id = sec_mat_map.get(sec_id, default_mat_id)
                 if mat_id not in valid_mat_ids:
                     mat_id = default_mat_id
+
+                # Calculate roll_angle from SAP2000 Angle
+                sap_angle = frame_angle_map.get(fid, 0.0)
+                ni = nodes_dict.get(ji)
+                nj = nodes_dict.get(jj)
+                if ni and nj:
+                    dx = float(nj.x - ni.x)
+                    dy = float(nj.y - ni.y)
+                    dz = float(getattr(nj, "z", 0.0) - getattr(ni, "z", 0.0))
+                    is_vertical = (dx**2 + dy**2) < 1e-12 and abs(dz) > 1e-12
+                    if is_vertical:
+                        roll_angle = sap_angle - 90.0
+                    else:
+                        roll_angle = sap_angle
+                else:
+                    roll_angle = sap_angle
+
+                # Normalize roll_angle to (-180, 180]
+                roll_angle = (roll_angle + 180.0) % 360.0 - 180.0
+                if abs(roll_angle) < 1e-6:
+                    roll_angle = 0.0
+
                 elements.append(
                     BeamElement(
                         id=fid,
@@ -219,6 +264,7 @@ class Sap2000FileReader(BaseModelReader):
                         end_node=jj,
                         material_id=mat_id,
                         section_id=sec_id,
+                        roll_angle=roll_angle,
                     )
                 )
 
@@ -233,33 +279,34 @@ class Sap2000FileReader(BaseModelReader):
                     load_cases_dict[pat] = LoadCase(id=pat, include_self_weight=self_wt)
 
         # 7. Joint Loads -> LoadCases with PointLoads
-        # Table: "JOINT LOADS - FORCE"
-        jt_loads_table = tables.get("JOINT LOADS - FORCE")
-        if jt_loads_table:
-            for row in jt_loads_table.rows:
-                jid = str(row.get("Joint", ""))
-                pat = str(row.get("LoadPat", row.get("LoadCase", "DEAD")))
-                if pat not in load_cases_dict:
-                    load_cases_dict[pat] = LoadCase(id=pat)
+        # Tables: "JOINT LOADS - FORCE", "AUTO SEISMIC LOADS TO JOINTS"
+        for tbl_name in ("JOINT LOADS - FORCE", "AUTO SEISMIC LOADS TO JOINTS"):
+            jt_loads_table = tables.get(tbl_name)
+            if jt_loads_table:
+                for row in jt_loads_table.rows:
+                    jid = str(row.get("Joint", ""))
+                    pat = str(row.get("LoadPat", row.get("LoadCase", "DEAD")))
+                    if pat not in load_cases_dict:
+                        load_cases_dict[pat] = LoadCase(id=pat)
 
-                fx = float(row.get("F1", row.get("Fx", 0.0)))
-                fy = float(row.get("F2", row.get("Fy", 0.0)))
-                fz = float(row.get("F3", row.get("Fz", 0.0)))
-                mx = float(row.get("M1", row.get("Mx", 0.0)))
-                my = float(row.get("M2", row.get("My", 0.0)))
-                mz = float(row.get("M3", row.get("Mz", 0.0)))
+                    fx = float(row.get("F1", row.get("Fx", row.get("FX", 0.0))))
+                    fy = float(row.get("F2", row.get("Fy", row.get("FY", 0.0))))
+                    fz = float(row.get("F3", row.get("Fz", row.get("FZ", 0.0))))
+                    mx = float(row.get("M1", row.get("Mx", row.get("MX", 0.0))))
+                    my = float(row.get("M2", row.get("My", row.get("MY", 0.0))))
+                    mz = float(row.get("M3", row.get("Mz", row.get("MZ", 0.0))))
 
-                load_cases_dict[pat].point_loads.append(
-                    PointLoad(
-                        node_id=jid,
-                        fx=fx,
-                        fy=fy,
-                        fz=fz,
-                        mx=mx,
-                        my=my,
-                        mz=mz,
+                    load_cases_dict[pat].point_loads.append(
+                        PointLoad(
+                            node_id=jid,
+                            fx=fx,
+                            fy=fy,
+                            fz=fz,
+                            mx=mx,
+                            my=my,
+                            mz=mz,
+                        )
                     )
-                )
 
         # 8. Frame Loads -> DistributedLoads
         # Table: "FRAME LOADS - DISTRIBUTED"
@@ -392,6 +439,78 @@ class Sap2000FileReader(BaseModelReader):
                     DistributedLoad(**load_kwargs)
                 )
 
+        # 9. Mass Source
+        # Table: "MASS SOURCE"
+        mass_source: Optional[MassSource] = None
+        ms_table = tables.get("MASS SOURCE")
+        if ms_table and ms_table.rows:
+            first_row = ms_table.rows[0]
+            ms_id = str(first_row.get("MassSource", "MSSSRC1"))
+            inc_elem = False
+            factors: List[MassSourceFactor] = []
+            for row in ms_table.rows:
+                elem_val = str(row.get("Elements", "")).strip().lower()
+                if elem_val in ("yes", "true", "1"):
+                    inc_elem = True
+                pat = str(row.get("LoadPat", "")).strip()
+                if pat:
+                    mult = float(row.get("Multiplier", 0.0)) if row.get("Multiplier") is not None else 0.0
+                    # In SAP2000, if Elements=No but DEAD (with SelfWtMult=1) is in mass source with multiplier > 0,
+                    # DEAD represents element self-mass.
+                    if pat.upper() == "DEAD" and mult > 0.0 and not inc_elem:
+                        inc_elem = True
+                    factors.append(MassSourceFactor(load_case_id=pat, factor=mult))
+            mass_source = MassSource(
+                id=ms_id,
+                name=ms_id,
+                include_element_mass=inc_elem,
+                factors=factors,
+            )
+
+        # 10. Modal Analysis Cases
+        # Table: "CASE - MODAL 1 - GENERAL"
+        analysis_cases = []
+        modal_table = tables.get("CASE - MODAL 1 - GENERAL")
+        if modal_table:
+            for row in modal_table.rows:
+                cid = str(row.get("Case", "MODAL"))
+                num_modes = int(row.get("MaxNumModes", 12))
+                analysis_cases.append(ModalAnalysis(id=cid, num_modes=num_modes))
+
+        # 11. Response Spectrum Analysis Cases
+        # Tables: "CASE - RESPONSE SPECTRUM 1 - GENERAL", "CASE - RESPONSE SPECTRUM 2 - LOAD ASSIGNMENTS"
+        rsa_table = tables.get("CASE - RESPONSE SPECTRUM 1 - GENERAL")
+        rsa_assign = tables.get("CASE - RESPONSE SPECTRUM 2 - LOAD ASSIGNMENTS")
+        if rsa_table:
+            for row in rsa_table.rows:
+                cid = str(row.get("Case", "RSx"))
+                combo = str(row.get("ModalCombo", "CQC"))
+                damp = float(row.get("ConstDamp", 0.05)) if row.get("ConstDamp") is not None else 0.05
+                dir_val = "X"
+                sf_val = 9.80665
+                fn_name = "asce7-22"
+                if rsa_assign:
+                    for a_row in rsa_assign.rows:
+                        if str(a_row.get("Case", "")) == cid:
+                            lname = str(a_row.get("LoadName", "U1"))
+                            dir_val = "Y" if "U2" in lname else ("Z" if "U3" in lname else "X")
+                            if a_row.get("TransAccSF"):
+                                sf_val = float(a_row.get("TransAccSF"))
+                            if a_row.get("Function"):
+                                fn_name = str(a_row.get("Function"))
+                            break
+                analysis_cases.append(
+                    ResponseSpectrumAnalysis(
+                        id=cid,
+                        name=cid,
+                        direction=dir_val,
+                        combination=combo,
+                        damping_ratio=damp,
+                        scale_factor=sf_val,
+                        function_name=fn_name,
+                    )
+                )
+
         return StructuralModel(
             nodes=nodes,
             elements=elements,
@@ -399,4 +518,7 @@ class Sap2000FileReader(BaseModelReader):
             sections=sections,
             supports=supports,
             load_cases=list(load_cases_dict.values()),
+            analysis_cases=analysis_cases,
+            mass_source=mass_source,
+            mass_sources=[mass_source] if mass_source else [],
         )

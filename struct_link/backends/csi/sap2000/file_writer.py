@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
-from struct_core import Project, StructuralModel
+from struct_core import Project, StructuralModel, parse_units
 
 from ....base import BaseModelWriter
 from ..s2k_parser import S2kWriter
@@ -121,21 +121,37 @@ class Sap2000FileWriter(BaseModelWriter):
                 }
             )
 
-            rho = float(getattr(m, "rho", 2400.0 if mat_type == "Concrete" else 7850.0))
+            parsed_u = parse_units(units_str)
+            g_acc = parsed_u.gravity_acceleration
+
             E = float(getattr(m, "E", 2.5e7 if mat_type == "Concrete" else 2.0e8))
             nu = float(getattr(m, "nu", 0.2 if mat_type == "Concrete" else 0.3))
             G = float(getattr(m, "G", E / (2.0 * (1.0 + nu))))
             unit_wt = getattr(m, "unit_weight", None)
-            if unit_wt is None:
-                unit_wt = rho * 9.81 if rho > 10 else rho * 386.4
-            else:
+            if unit_wt is not None and float(unit_wt) > 0.0:
                 unit_wt = float(unit_wt)
+            else:
+                rho_val = getattr(m, "rho", None)
+                if rho_val is not None and float(rho_val) > 0.0:
+                    rho_f = float(rho_val)
+                    if "kn" in units_str.lower():
+                        unit_wt = (rho_f * g_acc) / 1000.0
+                    else:
+                        unit_wt = rho_f * g_acc
+                else:
+                    if mat_type == "Concrete":
+                        unit_wt = 24.0 if "kn" in units_str.lower() else (2400.0 * g_acc)
+                    else:
+                        unit_wt = 76.97 if "kn" in units_str.lower() else (7850.0 * g_acc)
+
+            # In SAP2000, UnitMass is the consistent mass density (Force * s^2 / L^4 = UnitWeight / g)
+            unit_mass = unit_wt / g_acc
 
             mat_mech_rows.append(
                 {
                     "Material": mid,
-                    "UnitMass": rho,
                     "UnitWeight": unit_wt,
+                    "UnitMass": unit_mass,
                     "E1": E,
                     "G12": G,
                     "U12": nu,
@@ -144,12 +160,16 @@ class Sap2000FileWriter(BaseModelWriter):
             )
 
         if not mat_mech_rows:
+            parsed_u = parse_units(units_str)
+            g_acc = parsed_u.gravity_acceleration
+            conc_wt = 24.0 if "kn" in units_str.lower() else (2400.0 * g_acc)
+            conc_mass = conc_wt / g_acc
             mat_gen_rows.append({"Material": "CONC", "Type": "Concrete", "SymType": "Isotropic", "TempDepend": "No"})
             mat_mech_rows.append(
                 {
                     "Material": "CONC",
-                    "UnitMass": 2400.0,
-                    "UnitWeight": 23544.0,
+                    "UnitWeight": conc_wt,
+                    "UnitMass": conc_mass,
                     "E1": 2.5e7,
                     "G12": 1.0416666e7,
                     "U12": 0.2,
@@ -274,13 +294,18 @@ class Sap2000FileWriter(BaseModelWriter):
 
                 self_wt_mult = 1.0 if getattr(lc, "include_self_weight", False) else 0.0
 
-                pat_rows.append(
-                    {
-                        "LoadPat": pat,
-                        "DesignType": des_type,
-                        "SelfWtMult": self_wt_mult,
-                    }
-                )
+                pat_row = {
+                    "LoadPat": pat,
+                    "DesignType": des_type,
+                    "SelfWtMult": self_wt_mult,
+                }
+                auto_load = getattr(lc, "auto_load", None)
+                if auto_load:
+                    pat_row["AutoLoad"] = str(auto_load)
+                elif des_type in ("Quake", "Wind", "Wave", "Snow"):
+                    pat_row["AutoLoad"] = "None"
+
+                pat_rows.append(pat_row)
 
                 case_rows.append(
                     {
@@ -304,10 +329,13 @@ class Sap2000FileWriter(BaseModelWriter):
             case_rows.append({"Case": "DEAD", "Type": "LinStatic", "InitialCond": "Zero", "DesignType": "Dead"})
             static_assign_rows.append({"Case": "DEAD", "LoadType": "Load pattern", "LoadName": "DEAD", "LoadSF": 1.0})
 
-        # Add default MODAL dynamic load case
+        # Add MODAL dynamic load case
+        modal_cases = [ac for ac in getattr(model, "analysis_cases", []) if getattr(ac, "type", "") == "modal"]
+        n_modes = modal_cases[0].num_modes if modal_cases else 12
+        modal_case_name = str(modal_cases[0].id) if modal_cases else "MODAL"
         case_rows.append(
             {
-                "Case": "MODAL",
+                "Case": modal_case_name,
                 "Type": "LinModal",
                 "InitialCond": "Zero",
                 "DesignType": "Other",
@@ -315,17 +343,99 @@ class Sap2000FileWriter(BaseModelWriter):
         )
         modal_rows = [
             {
-                "Case": "MODAL",
+                "Case": modal_case_name,
                 "ModeType": "Eigen",
-                "MaxNumModes": 12,
+                "MaxNumModes": n_modes,
                 "MinNumModes": 1,
             }
         ]
+
+        # Add RESPONSE SPECTRUM dynamic load cases if defined
+        rsa_cases = [ac for ac in getattr(model, "analysis_cases", []) if getattr(ac, "type", "") == "response_spectrum"]
+        rsa_gen_rows = []
+        rsa_assign_rows = []
+        for rsa in rsa_cases:
+            rcid = str(rsa.id)
+            case_rows.append({
+                "Case": rcid,
+                "Type": "LinRespSpec",
+                "InitialCond": "Zero",
+                "DesignType": "Quake",
+            })
+            rsa_gen_rows.append({
+                "Case": rcid,
+                "ModalCombo": getattr(rsa, "combination", "CQC"),
+                "GMCf1": 1.0,
+                "GMCf2": 0.0,
+                "PerRigid": "SRSS",
+                "DirCombo": "SRSS",
+                "MotionType": "Acceleration",
+                "DampingType": "Constant",
+                "ConstDamp": float(getattr(rsa, "damping_ratio", 0.05)),
+                "EccenRatio": 0.0,
+                "NumOverride": 0,
+            })
+            dir_str = str(getattr(rsa, "direction", "X")).upper()
+            u_dir = "U1" if dir_str == "X" else ("U2" if dir_str == "Y" else "U3")
+            func_name = str(getattr(rsa, "function_name", "asce7-22"))
+            rsa_assign_rows.append({
+                "Case": rcid,
+                "LoadType": "Acceleration",
+                "LoadName": u_dir,
+                "CoordSys": "GLOBAL",
+                "Function": func_name,
+                "Angle": 0.0,
+                "TransAccSF": float(getattr(rsa, "scale_factor", 9.80665)),
+            })
 
         tables["LOAD PATTERN DEFINITIONS"] = pat_rows
         tables["LOAD CASE DEFINITIONS"] = case_rows
         tables["CASE - STATIC 1 - LOAD ASSIGNMENTS"] = static_assign_rows
         tables["CASE - MODAL 1 - GENERAL"] = modal_rows
+        if rsa_gen_rows:
+            tables["CASE - RESPONSE SPECTRUM 1 - GENERAL"] = rsa_gen_rows
+            tables["CASE - RESPONSE SPECTRUM 2 - LOAD ASSIGNMENTS"] = rsa_assign_rows
+
+        # Response spectrum function table (ASCE 7-22)
+        spec_params = getattr(model, "seismic_parameters", None)
+        if spec_params is None and isinstance(model_or_project, Project):
+            spec_params = getattr(model_or_project, "seismic_parameters", None)
+        if spec_params is None and rsa_cases:
+            for rsa in rsa_cases:
+                if getattr(rsa, "sds", None) is not None and getattr(rsa, "sd1", None) is not None:
+                    from struct_load import SeismicParameters
+                    spec_params = SeismicParameters(
+                        sds=float(rsa.sds),
+                        sd1=float(rsa.sd1),
+                        tl=float(getattr(rsa, "tl", 8.0) or 8.0),
+                        site_class=str(getattr(rsa, "site_class", "D") or "D"),
+                        damping_ratio=float(getattr(rsa, "damping_ratio", 0.05)),
+                    )
+                    break
+        if spec_params is not None:
+            try:
+                from struct_load import calculate_design_response_spectrum
+                spec_data = calculate_design_response_spectrum(spec_params)
+                fn_name = "asce7-22"
+                func_rows = []
+                for idx, (t_val, sa_val) in enumerate(zip(spec_data["periods"], spec_data["sa"])):
+                    row = {
+                        "Name": fn_name,
+                        "Period": float(t_val),
+                        "Accel": float(sa_val),
+                    }
+                    if idx == 0:
+                        row["FuncDamp"] = float(getattr(spec_params, "damping_ratio", 0.05))
+                        row["Direction"] = "Horizontal"
+                        row["SpecType"] = "Design"
+                        row["SiteClass"] = str(getattr(spec_params, "site_class", "D"))
+                        row["Ssd"] = float(getattr(spec_params, "sds", 1.0))
+                        row["Sd1"] = float(getattr(spec_params, "sd1", 0.4))
+                        row["TL"] = float(getattr(spec_params, "tl", 8.0))
+                    func_rows.append(row)
+                tables["FUNCTION - RESPONSE SPECTRUM - ASCE 7-22"] = func_rows
+            except Exception:
+                pass
 
         # 7. Joint Coordinates
         coord_rows = []
@@ -348,6 +458,9 @@ class Sap2000FileWriter(BaseModelWriter):
         sec_assign_rows = []
         default_sec = model.sections[0].id if model.sections else "DEFAULT_SEC"
 
+        node_coords = {str(n.id): n for n in model.nodes}
+        local_axes_rows = []
+
         for el in model.elements:
             fid = str(el.id)
             conn_rows.append(
@@ -368,8 +481,39 @@ class Sap2000FileWriter(BaseModelWriter):
                 }
             )
 
+            # Local axes assignment
+            # In fem3d/struct_core:
+            # - For horizontal/inclined members: default matches SAP2000 Angle = 0.
+            # - For vertical members pointing +Z: fem3d default has v2=+Y, v3=-X,
+            #   which corresponds to SAP2000 Angle = 90.
+            roll_angle = float(getattr(el, "roll_angle", 0.0) or 0.0)
+            ni = node_coords.get(str(el.start_node))
+            nj = node_coords.get(str(el.end_node))
+            if ni and nj:
+                dx = float(nj.x - ni.x)
+                dy = float(nj.y - ni.y)
+                dz = float(getattr(nj, "z", 0.0) - getattr(ni, "z", 0.0))
+                is_vertical = (dx**2 + dy**2) < 1e-12 and abs(dz) > 1e-12
+                if is_vertical:
+                    sap_angle = roll_angle + 90.0
+                else:
+                    sap_angle = roll_angle
+
+                # Normalize angle to (-180, 180]
+                sap_angle = (sap_angle + 180.0) % 360.0 - 180.0
+                if abs(sap_angle) > 1e-6:
+                    local_axes_rows.append(
+                        {
+                            "Frame": fid,
+                            "Angle": sap_angle,
+                            "AdvanceAxes": "No",
+                        }
+                    )
+
         tables["CONNECTIVITY - FRAME"] = conn_rows
         tables["FRAME SECTION ASSIGNMENTS"] = sec_assign_rows
+        if local_axes_rows:
+            tables["FRAME LOCAL AXES ASSIGNMENTS 1 - TYPICAL"] = local_axes_rows
 
         # 9. Joint Restraint Assignments
         restr_rows = []
@@ -458,5 +602,43 @@ class Sap2000FileWriter(BaseModelWriter):
             tables["JOINT LOADS - FORCE"] = jt_load_rows
         if frm_load_rows:
             tables["FRAME LOADS - DISTRIBUTED"] = frm_load_rows
+
+        # 11. Mass Source
+        if getattr(model, "mass_source", None):
+            ms = model.mass_source
+            ms_id = str(getattr(ms, "id", None) or "MSSSRC1")
+            ms_rows = []
+            factors = getattr(ms, "factors", [])
+            inc_elem = bool(getattr(ms, "include_element_mass", False))
+
+            has_dead_factor = any(
+                str(f.load_case_id).upper() == "DEAD" and float(f.factor) > 0.0
+                for f in factors
+            )
+            elements_str = "Yes" if (inc_elem and not has_dead_factor) else "No"
+            loads_str = "Yes" if factors else "No"
+
+            if factors:
+                for idx, f in enumerate(factors):
+                    row = {
+                        "MassSource": ms_id,
+                    }
+                    if idx == 0:
+                        row["Elements"] = elements_str
+                        row["Masses"] = "No"
+                        row["Loads"] = loads_str
+                        row["IsDefault"] = "Yes"
+                    row["LoadPat"] = str(f.load_case_id)
+                    row["Multiplier"] = float(f.factor)
+                    ms_rows.append(row)
+            else:
+                ms_rows.append({
+                    "MassSource": ms_id,
+                    "Elements": elements_str,
+                    "Masses": "No",
+                    "Loads": "No",
+                    "IsDefault": "Yes",
+                })
+            tables["MASS SOURCE"] = ms_rows
 
         return S2kWriter.write_tables(tables, target_path)

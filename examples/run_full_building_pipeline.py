@@ -19,7 +19,7 @@ from typing import Dict, Any
 
 from struct_core import Project, validate_structural_model
 from struct_link import read_project
-from struct_load import LoadGenerator
+from struct_load import LoadGenerator, SeismicParameters
 from fem3d import model_from_core, Results
 from aci318.codes.aci318_19 import ACI318_19
 from aci318.materials.concrete import Concrete
@@ -115,11 +115,10 @@ def run_pipeline(
 
     # 2b. Lateral Seismic ELF (EQ_X and EQ_Y)
     # Automatically derives exact effective seismic weight W from the model's dead load
+    params = SeismicParameters(sds=0.75, sd1=0.40, r_factor=8.0)
     seismic_cases, elf_res = load_gen.apply_lateral_seismic(
         project,
-        sds=0.75,
-        sd1=0.40,
-        r_factor=8.0,
+        params=params,
         direction="both",
     )
 

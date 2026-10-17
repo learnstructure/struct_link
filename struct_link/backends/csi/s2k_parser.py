@@ -118,7 +118,7 @@ class S2kWriter:
                 v_str = "Yes" if v else "No"
             elif isinstance(v, float):
                 # Format float cleanly without trailing zeros if integer
-                v_str = f"{v:.6g}"
+                v_str = f"{v:.10g}"
             elif isinstance(v, str) and (" " in v or not v):
                 v_str = f'"{v}"'
             else:
