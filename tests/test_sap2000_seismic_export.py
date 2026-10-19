@@ -31,6 +31,10 @@ def test_export_sap2000_seismic_model(tmp_path: Path):
     s2k_text = export_file.read_text(encoding="utf-8")
     assert 'TABLE:  "FRAME LOCAL AXES ASSIGNMENTS 1 - TYPICAL"' in s2k_text
     assert "Frame=1   Angle=90   AdvanceAxes=No" in s2k_text
+    assert 'TABLE:  "AUTO SEISMIC - ASCE 7-22"' in s2k_text
+    assert 'TABLE:  "AUTO SEISMIC LOADS TO JOINTS"' in s2k_text
+    assert 'LoadPat=EQx' in s2k_text
+    assert 'AutoLoad="ASCE 7-22"' in s2k_text
 
     # 2. Re-import model
     re_proj = read_project(export_file)
@@ -41,7 +45,10 @@ def test_export_sap2000_seismic_model(tmp_path: Path):
     assert len(re_model.nodes) == 18
     assert len(re_model.elements) == 26
     assert len(re_model.supports) == 6
-    assert {"DEAD", "SuperDead", "LIVE", "EQ_X"}.issubset({lc.id for lc in re_model.load_cases})
+    assert {"DEAD", "SuperDead", "LIVE", "EQx"}.issubset({lc.id for lc in re_model.load_cases})
+    eqx_case = next(lc for lc in re_model.load_cases if lc.id == "EQx")
+    assert eqx_case.auto_load == "ASCE 7-22"
+    assert eqx_case.seismic_params is not None
 
     # 4. Verify Mass Source
     assert re_model.mass_source is not None
@@ -58,8 +65,8 @@ def test_export_sap2000_seismic_model(tmp_path: Path):
         fz = float(reacs[reacs["node"].isin(sup_nodes)]["Fz"].sum())
         assert pytest.approx(fz, rel=1e-3) == target
 
-    # 6. Verify ELF Lateral Seismic Base Shear (EQ_X)
-    st_elf = model_from_core(re_proj, load_case_id="EQ_X", include_shear_deformation=True)
+    # 6. Verify ELF Lateral Seismic Base Shear (EQx)
+    st_elf = model_from_core(re_proj, load_case_id="EQx", include_shear_deformation=True)
     st_elf.solve()
     reacs_elf = Results(st_elf).reactions()
     sup_nodes = [nid for nid, n in st_elf.nodes.items() if n.is_supported()]

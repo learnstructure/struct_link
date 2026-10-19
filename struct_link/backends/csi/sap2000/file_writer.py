@@ -268,6 +268,19 @@ class Sap2000FileWriter(BaseModelWriter):
         case_rows = []
         static_assign_rows = []
 
+        spec_params = getattr(model, "seismic_parameters", None)
+        if spec_params is None and isinstance(model_or_project, Project):
+            spec_params = getattr(model_or_project, "seismic_parameters", None)
+
+        all_z = [float(getattr(n, "z", 0.0)) for n in model.nodes]
+        max_z = max(all_z) if all_z else 7.0
+        sup_node_ids = {str(s.node_id) for s in model.supports}
+        sup_z = [float(getattr(n, "z", 0.0)) for n in model.nodes if str(n.id) in sup_node_ids]
+        min_z = min(sup_z) if sup_z else (min(all_z) if all_z else 0.0)
+
+        auto_seismic_rows = []
+        auto_seismic_patterns = set()
+
         load_cases = getattr(model, "load_cases", [])
         if load_cases:
             for lc in load_cases:
@@ -300,8 +313,79 @@ class Sap2000FileWriter(BaseModelWriter):
                     "SelfWtMult": self_wt_mult,
                 }
                 auto_load = getattr(lc, "auto_load", None)
+                if not auto_load and is_quake:
+                    if getattr(lc, "seismic_params", None) or spec_params:
+                        auto_load = "ASCE 7-22"
+
                 if auto_load:
                     pat_row["AutoLoad"] = str(auto_load)
+                    if str(auto_load).upper() == "ASCE 7-22":
+                        auto_seismic_patterns.add(pat)
+                        sparams = getattr(lc, "seismic_params", None) or {}
+                        if not sparams and spec_params:
+                            sparams = {
+                                "sds": getattr(spec_params, "sds", 1.0),
+                                "sd1": getattr(spec_params, "sd1", 0.4),
+                                "s1": getattr(spec_params, "s1", 0.35),
+                                "tl": getattr(spec_params, "tl", 8.0),
+                                "r_factor": getattr(spec_params, "r_factor", 8.0),
+                                "importance_factor": getattr(spec_params, "importance_factor", 1.0),
+                                "site_class": getattr(spec_params, "site_class", "D"),
+                                "system_type": getattr(spec_params, "system_type", "rc_smf"),
+                                "method": getattr(spec_params, "method", 2),
+                            }
+
+                        dir_val = sparams.get("direction", "Y" if "Y" in upat else "X")
+                        stype = str(sparams.get("system_type", "rc_smf")).lower()
+                        if "steel" in stype:
+                            ct_and_x = "0.028ft, 0.8"
+                        elif "brace" in stype:
+                            ct_and_x = "0.030ft, 0.75"
+                        else:
+                            ct_and_x = "0.016ft, 0.9"
+
+                        r_val = float(sparams.get("r_factor", 8.0))
+                        omega_val = float(sparams.get("omega", 3.0))
+                        cd_val = float(sparams.get("cd", 5.5))
+                        i_val = float(sparams.get("importance_factor", 1.0))
+                        sds_val = float(sparams.get("sds", 1.0))
+                        sd1_val = float(sparams.get("sd1", 0.4))
+                        s1_val = float(sparams.get("s1", 0.35) if sparams.get("s1") is not None else round(sd1_val * 0.875, 4))
+                        tl_val = float(sparams.get("tl", 8.0))
+                        site_class = str(sparams.get("site_class", "D"))
+                        method_type = f"Method {sparams.get('method', 2)}"
+
+                        hn = max(0.1, max_z - min_z)
+                        t_used = float(sparams.get("period_used") or (0.0466 * (hn ** 0.9)))
+                        cs_used = float(sparams.get("coeff_used") or (sds_val / (r_val / i_val)))
+                        w_used = float(sparams.get("weight_used") or 1028.72)
+                        vb_val = float(sparams.get("base_shear") or (cs_used * w_used))
+
+                        auto_seismic_rows.append({
+                            "LoadPat": pat,
+                            "Dir": dir_val,
+                            "PercentEcc": float(sparams.get("percent_ecc", 0)),
+                            "EccOverride": False,
+                            "PeriodCalc": "Approximate",
+                            "CtAndX": ct_and_x,
+                            "UserZ": True,
+                            "MaxZ": max_z,
+                            "MinZ": min_z,
+                            "MethodType": method_type,
+                            "R": int(r_val) if r_val.is_integer() else r_val,
+                            "Omega": int(omega_val) if omega_val.is_integer() else omega_val,
+                            "Cd": cd_val,
+                            "I": int(i_val) if i_val.is_integer() else i_val,
+                            "Sds": sds_val,
+                            "Sd1": sd1_val,
+                            "S1": s1_val,
+                            "TL": int(tl_val) if tl_val.is_integer() else tl_val,
+                            "SiteClass": site_class,
+                            "TUsed": t_used,
+                            "CoeffUsed": cs_used,
+                            "WeightUsed": w_used,
+                            "BaseShear": vb_val,
+                        })
                 elif des_type in ("Quake", "Wind", "Wave", "Snow"):
                     pat_row["AutoLoad"] = "None"
 
@@ -389,6 +473,8 @@ class Sap2000FileWriter(BaseModelWriter):
             })
 
         tables["LOAD PATTERN DEFINITIONS"] = pat_rows
+        if auto_seismic_rows:
+            tables["AUTO SEISMIC - ASCE 7-22"] = auto_seismic_rows
         tables["LOAD CASE DEFINITIONS"] = case_rows
         tables["CASE - STATIC 1 - LOAD ASSIGNMENTS"] = static_assign_rows
         tables["CASE - MODAL 1 - GENERAL"] = modal_rows
@@ -534,25 +620,50 @@ class Sap2000FileWriter(BaseModelWriter):
 
         # 10. Loads
         jt_load_rows = []
+        auto_seismic_joint_rows = []
         frm_load_rows = []
+        node_coords = {str(n.id): n for n in model.nodes}
 
         for lc in load_cases:
             pat = str(lc.id)
+            is_auto_seismic = pat in auto_seismic_patterns
+
             for pl in getattr(lc, "point_loads", []):
-                jt_load_rows.append(
-                    {
-                        "Joint": str(pl.node_id),
-                        "LoadPat": pat,
-                        "CoordSys": "GLOBAL",
-                        "Type": "Force",
-                        "F1": float(getattr(pl, "fx", 0.0)),
-                        "F2": float(getattr(pl, "fy", 0.0)),
-                        "F3": float(getattr(pl, "fz", 0.0)),
-                        "M1": float(getattr(pl, "mx", 0.0)),
-                        "M2": float(getattr(pl, "my", 0.0)),
-                        "M3": float(getattr(pl, "mz", 0.0)),
-                    }
-                )
+                nid = str(pl.node_id)
+                n = node_coords.get(nid)
+                if is_auto_seismic:
+                    auto_seismic_joint_rows.append(
+                        {
+                            "LoadPat": pat,
+                            "AutoLdType": "ASCE 7-22",
+                            "JointElem": nid,
+                            "Joint": nid,
+                            "FX": float(getattr(pl, "fx", 0.0)),
+                            "FY": float(getattr(pl, "fy", 0.0)),
+                            "FZ": float(getattr(pl, "fz", 0.0)),
+                            "MX": float(getattr(pl, "mx", 0.0)),
+                            "MY": float(getattr(pl, "my", 0.0)),
+                            "MZ": float(getattr(pl, "mz", 0.0)),
+                            "X": float(n.x) if n else 0.0,
+                            "Y": float(n.y) if n else 0.0,
+                            "Z": float(getattr(n, "z", 0.0)) if n else 0.0,
+                        }
+                    )
+                else:
+                    jt_load_rows.append(
+                        {
+                            "Joint": nid,
+                            "LoadPat": pat,
+                            "CoordSys": "GLOBAL",
+                            "Type": "Force",
+                            "F1": float(getattr(pl, "fx", 0.0)),
+                            "F2": float(getattr(pl, "fy", 0.0)),
+                            "F3": float(getattr(pl, "fz", 0.0)),
+                            "M1": float(getattr(pl, "mx", 0.0)),
+                            "M2": float(getattr(pl, "my", 0.0)),
+                            "M3": float(getattr(pl, "mz", 0.0)),
+                        }
+                    )
 
             for dl in getattr(lc, "element_loads", []):
                 wz = float(getattr(dl, "wz", 0.0) or 0.0)
@@ -600,6 +711,8 @@ class Sap2000FileWriter(BaseModelWriter):
 
         if jt_load_rows:
             tables["JOINT LOADS - FORCE"] = jt_load_rows
+        if auto_seismic_joint_rows:
+            tables["AUTO SEISMIC LOADS TO JOINTS"] = auto_seismic_joint_rows
         if frm_load_rows:
             tables["FRAME LOADS - DISTRIBUTED"] = frm_load_rows
 

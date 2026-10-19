@@ -6,12 +6,12 @@ Demonstrates reverse export interoperability:
    - Geometry, boundary conditions, and Timoshenko sections with shear areas (AS2/AS3).
    - Multiple gravity load cases: DEAD (self-weight), SuperDead (10 kN/m), and LIVE (4 kN/m).
    - Dynamic Mass Source definition (1.0*ElementMass + 1.0*SuperDead + 0.25*LIVE).
-   - Automated ASCE 7-22 Equivalent Lateral Force (ELF) seismic load generation (`EQ_X`).
+   - Automated ASCE 7-22 Equivalent Lateral Force (ELF) seismic load generation (`EQx`).
    - Dynamic Modal eigenvalue analysis case (12 modes).
    - Dynamic Response Spectrum Analysis case (`RSx`) with ASCE 7-22 design spectrum parameters.
 2. Solves the native Python model via `fem3d` to establish exact baseline benchmarks:
    - Gravity reactions: DEAD = 288.96 kN, SuperDead = 700.00 kN, LIVE = 280.00 kN.
-   - ELF base shear: EQ_X = 132.37 kN.
+   - ELF base shear: EQx = 132.37 kN.
    - Modal periods: T1 = 0.4577 s, T2 = 0.4167 s, T3 = 0.3874 s.
    - RSA base shear: RSx = 818.81 kN.
 3. Exports the model into native SAP2000 text format (.s2k) using `struct_link.write_model`.
@@ -96,15 +96,15 @@ def build_seismic_frame_project() -> Tuple[Project, SeismicParameters]:
         method=2,
     )
 
-    # 5. Generate ASCE 7-22 Equivalent Lateral Force (ELF) Seismic Loads (EQ_X)
+    # 5. Generate ASCE 7-22 Equivalent Lateral Force (ELF) Seismic Loads (EQx)
     generator = LoadGenerator(units="kN, m")
     generator.apply_lateral_seismic(
         core_model,
         params=seismic_params,
         direction="X",
-        seismic_case_id="EQ_X",
+        seismic_case_id="EQx",
         mass_source=mass_source,
-        distribution="face",
+        distribution="uniform",
     )
 
     # 6. Dynamic Analysis Cases (Modal & Response Spectrum)
@@ -132,7 +132,7 @@ def build_seismic_frame_project() -> Tuple[Project, SeismicParameters]:
 
 
 def run(show_plot: bool = False) -> Tuple[Project, Path]:
-    out_dir = Path(__file__).resolve().parent / "output"
+    out_dir = Path(__file__).resolve().parent / "output" / "etabs_sap_files"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / "exported_seismic_frame.s2k"
 
@@ -172,12 +172,12 @@ def run(show_plot: bool = False) -> Tuple[Project, Path]:
         print(f"  Gravity Case {lc_id:<11} : Fz = {val:10.2f} kN | Target = {expected_val:10.2f} kN")
 
     # (B) ELF Base Shear
-    st_elf = model_from_core(project, load_case_id="EQ_X", include_shear_deformation=True)
+    st_elf = model_from_core(project, load_case_id="EQx", include_shear_deformation=True)
     st_elf.solve()
     df_elf = Results(st_elf).reactions()
     sup_nodes = [nid for nid, n in st_elf.nodes.items() if n.is_supported()]
     orig_v_elf = abs(float(df_elf[df_elf["node"].isin(sup_nodes)]["Fx"].sum()))
-    print(f"  ELF Base Shear (EQ_X)   : Vbx = {orig_v_elf:10.2f} kN | Target = 132.37 kN")
+    print(f"  ELF Base Shear (EQx)    : Vbx = {orig_v_elf:10.2f} kN | Target = 132.37 kN")
 
     # (C) Dynamic Modal Analysis
     st_dyn = model_from_core(project, include_shear_deformation=True)
@@ -232,12 +232,12 @@ def run(show_plot: bool = False) -> Tuple[Project, Path]:
         print(f"  Re-imported {lc_id:<11} : Fz = {val:10.2f} kN | Baseline = {orig_fz[lc_id]:10.2f} kN | Diff = {diff:.6f} kN")
 
     # Re-solve ELF
-    st_re_elf = model_from_core(re_project, load_case_id="EQ_X", include_shear_deformation=True)
+    st_re_elf = model_from_core(re_project, load_case_id="EQx", include_shear_deformation=True)
     st_re_elf.solve()
     df_re_elf = Results(st_re_elf).reactions()
     sup_nodes = [nid for nid, n in st_re_elf.nodes.items() if n.is_supported()]
     re_v_elf = abs(float(df_re_elf[df_re_elf["node"].isin(sup_nodes)]["Fx"].sum()))
-    print(f"  Re-imported EQ_X Base Shear : {re_v_elf:10.2f} kN | Baseline = {orig_v_elf:10.2f} kN | Diff = {abs(re_v_elf - orig_v_elf):.6f} kN")
+    print(f"  Re-imported EQx Base Shear  : {re_v_elf:10.2f} kN | Baseline = {orig_v_elf:10.2f} kN | Diff = {abs(re_v_elf - orig_v_elf):.6f} kN")
 
     # Re-solve Dynamic Modal
     st_re_dyn = model_from_core(re_project, include_shear_deformation=True)
@@ -263,7 +263,7 @@ def run(show_plot: bool = False) -> Tuple[Project, Path]:
     print("1. Open CSI SAP2000.")
     print("2. Click 'File' -> 'Import' -> 'SAP2000 .s2k Text File...'.")
     print(f"3. Select: '{out_file.resolve()}'.")
-    print("4. Click 'Analyze' -> 'Run Analysis' (all cases: DEAD, SuperDead, LIVE, EQ_X, MODAL, RSx).")
+    print("4. Click 'Analyze' -> 'Run Analysis' (all cases: DEAD, SuperDead, LIVE, EQx, MODAL, RSx).")
     print("=" * 85)
 
     if show_plot:

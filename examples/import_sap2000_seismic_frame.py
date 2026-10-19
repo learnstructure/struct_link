@@ -30,9 +30,9 @@ from struct_load import SeismicParameters
 
 def run(show_plot: bool = False) -> Tuple[Project, Structure]:
     ref_path = (
-        Path(__file__).resolve().parent.parent
-        / "references"
-        / "sap2000"
+        Path(__file__).resolve().parent
+        / "output"
+        / "etabs_sap_files"
         / "frame_ELF_RSA_Timoshenko.s2k"
     )
     if not ref_path.exists():

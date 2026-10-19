@@ -13,7 +13,7 @@ TABLE:  "JOINT RESTRAINTS"
    Joint=2   U1=Yes   U2=Yes   U3=Yes   R1=Yes   R2=Yes   R3=Yes
 
 TABLE:  "MATERIAL PROPERTIES 02 - BASIC MECHANICAL PROPERTIES"
-   Material=CONC   UnitMass=2400   UnitWeight=23544   E1=25000000   U12=0.2   A1=0   G12=10416666
+   Material=CONC   UnitMass=2.4   UnitWeight=23.544   E1=25000000   U12=0.2   A1=0   G12=10416666
 
 TABLE:  "FRAME SECTION PROPERTIES 01 - GENERAL"
    SectionName=COL   Material=CONC   Shape=Rectangular   t3=0.4   t2=0.4   Area=0.16

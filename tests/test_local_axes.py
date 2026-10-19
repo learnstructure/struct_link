@@ -24,8 +24,9 @@ def test_local_axes_sap2000_import():
     """Verify that importing SAP2000 model maps Angle=90 on vertical columns to roll_angle=0 in struct_core."""
     ref_file = (
         Path(__file__).resolve().parent.parent
-        / "references"
-        / "sap2000"
+        / "examples"
+        / "output"
+        / "etabs_sap_files"
         / "frame_ELF_RSA_Timoshenko.s2k"
     )
     assert ref_file.exists(), f"Reference file not found: {ref_file}"

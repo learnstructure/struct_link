@@ -15,8 +15,9 @@ from struct_load import SeismicParameters
 def test_import_sap2000_seismic_model():
     ref_path = (
         Path(__file__).resolve().parent.parent
-        / "references"
-        / "sap2000"
+        / "examples"
+        / "output"
+        / "etabs_sap_files"
         / "frame_ELF_RSA_Timoshenko.s2k"
     )
     assert ref_path.exists(), f"Reference file not found: {ref_path}"
