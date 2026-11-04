@@ -9,6 +9,7 @@ import pytest
 
 from fem3d import model_from_core
 from struct_core import (
+    Support,
     BeamElement,
     ElasticMaterial,
     Node,
@@ -69,23 +70,24 @@ def test_local_axes_export_and_roundtrip(tmp_path: Path):
     ]
 
     mat = ElasticMaterial(id="CONC", E=3.0e7, nu=0.2, unit_weight=24.0)
-    sec = RectangularSection(id="R300x400", b=0.3, h=0.4)
+    sec = RectangularSection(id="R300x400", material_id="CONC", b=0.3, h=0.4)
     model.materials.append(mat)
     model.sections.append(sec)
+    model.supports = [Support.fixed(1)]
 
     model.elements = [
         # El 1: Vertical +Z, default roll_angle = 0.0 -> SAP2000 Angle = 90
-        BeamElement(id=1, start_node=1, end_node=2, material_id="CONC", section_id="R300x400", roll_angle=0.0),
+        BeamElement(id=1, start_node=1, end_node=2, section_id="R300x400", roll_angle=0.0),
         # El 2: Vertical +Z, rotated roll_angle = 45.0 -> SAP2000 Angle = 135
-        BeamElement(id=2, start_node=1, end_node=2, material_id="CONC", section_id="R300x400", roll_angle=45.0),
+        BeamElement(id=2, start_node=1, end_node=2, section_id="R300x400", roll_angle=45.0),
         # El 3: Vertical -Z, default roll_angle = 0.0 -> SAP2000 Angle = 90
-        BeamElement(id=3, start_node=1, end_node=5, material_id="CONC", section_id="R300x400", roll_angle=0.0),
+        BeamElement(id=3, start_node=1, end_node=5, section_id="R300x400", roll_angle=0.0),
         # El 4: Horizontal beam +X, default roll_angle = 0.0 -> SAP2000 Angle = 0
-        BeamElement(id=4, start_node=2, end_node=3, material_id="CONC", section_id="R300x400", roll_angle=0.0),
+        BeamElement(id=4, start_node=2, end_node=3, section_id="R300x400", roll_angle=0.0),
         # El 5: Horizontal beam +X, rotated roll_angle = 30.0 -> SAP2000 Angle = 30
-        BeamElement(id=5, start_node=2, end_node=3, material_id="CONC", section_id="R300x400", roll_angle=30.0),
+        BeamElement(id=5, start_node=2, end_node=3, section_id="R300x400", roll_angle=30.0),
         # El 6: Inclined 3D member, rotated roll_angle = -45.0 -> SAP2000 Angle = -45
-        BeamElement(id=6, start_node=3, end_node=4, material_id="CONC", section_id="R300x400", roll_angle=-45.0),
+        BeamElement(id=6, start_node=3, end_node=4, section_id="R300x400", roll_angle=-45.0),
     ]
 
     project = Project(model=model, units="kN, m")

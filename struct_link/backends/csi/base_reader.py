@@ -14,26 +14,83 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from struct_core import (
     BeamElement,
     CircularSection,
+    ConcreteMaterial,
     DistributedLoad,
     ElasticMaterial,
+    ElementPointLoad,
     GeneralSection,
     LoadCase,
+    LoadCaseFactor,
+    LoadCombination,
     MassSource,
     MassSourceFactor,
     ModalAnalysis,
     Node,
     PointLoad,
     Project,
+    RebarMaterial,
     RectangularSection,
     ResponseSpectrumAnalysis,
     StructuralModel,
     Support,
+    Units,
+    parse_units,
 )
 
 from ...base import BaseModelReader
 from .s2k_parser import S2kParser, S2kTable
 
 logger = logging.getLogger(__name__)
+
+
+def _csi_default_mass_source() -> MassSource:
+    """CSI default when a file defines no mass source: element self-mass only."""
+    return MassSource(
+        id="MSSSRC1",
+        name="CSI default (element self-mass)",
+        include_element_mass=True,
+        factors=[],
+    )
+
+
+def _csi_material(
+    material_id: str,
+    csi_type: Optional[str],
+    *,
+    E: Optional[float],
+    nu: Optional[float] = None,
+    unit_weight: Optional[float] = None,
+    rho: Optional[float] = None,
+    fc: Optional[float] = None,
+    fy: Optional[float] = None,
+    fu: Optional[float] = None,
+    messages: Optional[List[str]] = None,
+) -> Any:
+    """
+    The struct_core material for a CSI material, with only the properties the file states (in its units): concrete
+    with f'c -> ConcreteMaterial, rebar with Fy -> RebarMaterial, anything else (or concrete / rebar missing its
+    strength) -> ElasticMaterial. Nothing is assumed; a property the file lacks is left out and noted in
+    ``messages``.
+    """
+    if E is None:
+        raise ValueError(f"CSI material {material_id!r} has no modulus of elasticity (E).")
+    kind = (csi_type or "").strip().lower()
+    common: Dict[str, Any] = {"id": material_id, "name": csi_type or None, "E": E}
+    if nu is not None:
+        common["nu"] = nu
+    if unit_weight is not None:
+        common["unit_weight"] = unit_weight
+    if rho is not None:
+        common["rho"] = rho
+    if kind == "concrete" and fc is not None:
+        return ConcreteMaterial(fc=fc, **common)
+    if kind == "rebar" and fy is not None:
+        return RebarMaterial(fy=fy, fu=fu, **common)
+    if kind in ("concrete", "rebar") and messages is not None:
+        missing = "f'c" if kind == "concrete" else "Fy"
+        messages.append(f"Material {material_id!r} ({csi_type}) has no {missing}: imported as an elastic material; "
+                        f"set its {missing} before a code design.")
+    return ElasticMaterial(**common)
 
 
 class CsiFileReader(BaseModelReader):
@@ -55,19 +112,30 @@ class CsiFileReader(BaseModelReader):
                 return True
         return False
 
-    def read_model(self, source: Union[str, Path]) -> StructuralModel:
+    def read_model(self, source: Union[str, Path], allow_partial_import: bool = False) -> StructuralModel:
+        self.messages: List[str] = []  # import notes, e.g. a concrete material without f'c
+        self.ignored_tables: List[str] = []
+        self.dropped_items: List[str] = []
         path = Path(source)
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
 
         if self._is_dollar_e2k(content):
-            proj = self._build_project_from_dollar_e2k(content)
+            proj = self._build_project_from_dollar_e2k(content, allow_partial_import=allow_partial_import)
             return proj.model
 
         tables = S2kParser.parse_string(content)
-        return self._build_model(tables)
+        return self._build_model(tables, allow_partial_import=allow_partial_import)
 
-    def read_project(self, source: Union[str, Path], title: Optional[str] = None) -> Project:
+    def read_project(
+        self,
+        source: Union[str, Path],
+        title: Optional[str] = None,
+        allow_partial_import: bool = False,
+    ) -> Project:
+        self.messages: List[str] = []  # import notes, e.g. a concrete material without f'c
+        self.ignored_tables: List[str] = []
+        self.dropped_items: List[str] = []
         path = Path(source)
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
@@ -75,33 +143,176 @@ class CsiFileReader(BaseModelReader):
         file_title = title or (path.stem if hasattr(path, "stem") else str(path))
 
         if self._is_dollar_e2k(content):
-            return self._build_project_from_dollar_e2k(content, title=file_title)
+            return self._build_project_from_dollar_e2k(
+                content, title=file_title, allow_partial_import=allow_partial_import
+            )
 
         tables = S2kParser.parse_string(content)
-        model = self._build_model(tables)
+        model = self._build_model(tables, allow_partial_import=allow_partial_import)
         project = Project(model=model)
         project.metadata.title = file_title
-
-        # Extract units from PROGRAM CONTROL or PROGRAM INFORMATION if defined
-        prog_table = tables.get("PROGRAM CONTROL") or tables.get("PROGRAM INFORMATION")
-        if prog_table and prog_table.rows:
-            curr_units = prog_table.rows[0].get("CurrUnits")
-            if curr_units and isinstance(curr_units, str):
-                try:
-                    from struct_core import parse_units
-
-                    parsed_units = parse_units(curr_units)
-                    project.metadata.units = parsed_units
-                    if project.model:
-                        project.model.units = parsed_units
-                except Exception as exc:
-                    logger.warning(
-                        "Could not parse CSI CurrUnits '%s': %s", curr_units, exc
-                    )
-
+        project.units = getattr(self, "_detected_units", Units())
         return project
 
-    def _build_model(self, tables: Dict[str, S2kTable]) -> StructuralModel:
+    def _build_model(
+        self, tables: Dict[str, S2kTable], allow_partial_import: bool = False
+    ) -> StructuralModel:
+        from struct_core import Units, parse_units
+
+        prog_table = tables.get("PROGRAM CONTROL") or tables.get("PROGRAM INFORMATION")
+        curr_units = None
+        if prog_table and prog_table.rows:
+            curr_units = prog_table.rows[0].get("CurrUnits")
+        if not curr_units or not isinstance(curr_units, str) or not curr_units.strip():
+            raise ValueError("The file states no units (PROGRAM CONTROL / CurrUnits)")
+        try:
+            model_units = parse_units(curr_units)
+        except Exception as exc:
+            raise ValueError(f"The file states no units (PROGRAM CONTROL / CurrUnits): {exc}")
+        self._detected_units = model_units
+
+        # Table classification: HANDLED, IGNORABLE, AFFECTS_RESULTS
+        handled_tables = {
+            "PROGRAM CONTROL",
+            "PROGRAM INFORMATION",
+            "PROJECT INFORMATION",
+            "COORDINATE SYSTEMS",
+            "ACTIVE DEGREES OF FREEDOM",
+            "JOINT COORDINATES",
+            "POINT COORDINATES",
+            "JOINT RESTRAINT ASSIGNMENTS",
+            "POINT ASSIGNMENTS - RESTRAINTS",
+            "JOINT RESTRAINTS",
+            "MATERIAL PROPERTIES 01 - GENERAL",
+            "MATERIAL PROPERTIES - GENERAL",
+            "MATERIAL PROPERTIES 03A - STEEL DATA",
+            "MATERIAL PROPERTIES 03B - CONCRETE DATA",
+            "MATERIAL PROPERTIES 03E - REBAR DATA",
+            "MATERIAL PROPERTIES 02 - BASIC MECHANICAL PROPERTIES",
+            "MATERIAL PROPERTIES",
+            "FRAME SECTION PROPERTIES 02 - CONCRETE COLUMN",
+            "FRAME SECTION PROPERTIES 03 - CONCRETE BEAM",
+            "FRAME SECTION PROPERTIES 01 - GENERAL",
+            "FRAME SECTION PROPERTIES",
+            "FRAME SECTIONS",
+            "FRAME SECTION ASSIGNMENTS",
+            "CONNECTIVITY - FRAME",
+            "LINE CONNECTIVITY",
+            "FRAME LOCAL AXES ASSIGNMENTS 1 - TYPICAL",
+            "FRAME LOCAL AXES ASSIGNMENTS",
+            "LINE ASSIGNMENTS - LOCAL AXES",
+            "FRAME RELEASE ASSIGNMENTS 1 - GENERAL",
+            "FRAME RELEASE ASSIGNMENTS",
+            "FRAME RELEASES",
+            "FRAME PROPERTY MODIFIERS",
+            "LINE PROPERTY MODIFIERS",
+            "JOINT ADDED MASS ASSIGNMENTS",
+            "POINT ADDED MASS ASSIGNMENTS",
+            "LOAD PATTERN DEFINITIONS",
+            "LOAD CASE DEFINITIONS",
+            "AUTO SEISMIC - ASCE 7-22",
+            "POINT LOADS - FORCE",
+            "JOINT LOADS - FORCE",
+            "AUTO SEISMIC LOADS TO JOINTS",
+            "FRAME LOADS - DISTRIBUTED",
+            "LINE LOADS - DISTRIBUTED",
+            "FRAME LOADS - POINT",
+            "LINE LOADS - POINT",
+            "COMBINATION DEFINITIONS",
+            "LOAD COMBINATION DEFINITIONS",
+            "MASS SOURCE",
+            "CASE - MODAL 1 - GENERAL",
+            "CASE - RESPONSE SPECTRUM 1 - GENERAL",
+            "CASE - RESPONSE SPECTRUM 2 - LOAD ASSIGNMENTS",
+        }
+
+        ignorable_keywords = (
+            "DATABASE FORMAT",
+            "PREFERENCES",
+            "OPTIONS - COLORS",
+            "COLORS",
+            "GRID LINES",
+            "GROUPS",
+            "OBJECT DESIGN PROCEDURES",
+            "OUTPUT OPTIONS",
+            "CASE - STATIC",
+            "ANALYSIS OPTIONS",
+            "DISPLAY",
+            "PRINT",
+            "COMMENT",
+            "USER COMMENTS",
+            "HYPERLINK",
+            "MATERIAL LIST",
+            "FRAME OUTPUT STATION ASSIGNMENTS",
+            "FUNCTION - PLOT FUNCTIONS",
+            "REBAR SIZES",
+            "FRAME AUTO MESH",
+            "FRAME LOAD TRANSFER",
+            "FRAME DESIGN PROCEDURES",
+            "OVERWRITES - CONCRETE DESIGN",
+            "OVERWRITES - STEEL DESIGN",
+            "SOLID PROPERTY DEFINITIONS",
+            "FUNCTION - RESPONSE SPECTRUM",
+            "FUNCTION - TIME HISTORY",
+            "FUNCTION - POWER SPECTRAL",
+            "FUNCTION - STEADY STATE",
+            "AUTO WAVE",
+            "JOINT PATTERN DEFINITIONS",
+            "MATERIAL PROPERTIES 03F",
+            "MATERIAL PROPERTIES 03J",
+            "MATERIAL PROPERTIES 03K",
+            "MATERIAL PROPERTIES 06",
+            "MATERIAL PROPERTIES 09",
+            "FRAME SECTION PROPERTIES 13",
+        )
+
+        unsupported_structural_keywords = (
+            "SPRING",
+            "OFFSET",
+            "CONSTRAINT",
+            "DIAPHRAGM",
+            "CONNECTIVITY - AREA",
+            "AREA SECTION ASSIGNMENTS",
+            "AREA ASSIGNMENTS",
+            "AREA LOADS",
+            "LINE ASSIGNMENTS - AREA",
+            "CONNECTIVITY - SOLID",
+            "SOLID SECTION ASSIGNMENTS",
+            "CONNECTIVITY - LINK",
+            "LINK ASSIGNMENTS",
+            "CONNECTIVITY - TENDON",
+            "TENDON ASSIGNMENTS",
+            "CONNECTIVITY - CABLE",
+            "CABLE ASSIGNMENTS",
+            "HINGE",
+            "PANEL ZONE",
+        )
+
+        for tname, tbl in tables.items():
+            t_up = tname.upper()
+            if t_up in handled_tables:
+                continue
+            is_ignorable = any(kw in t_up for kw in ignorable_keywords)
+            if is_ignorable:
+                self.ignored_tables.append(tname)
+                continue
+
+            # Affects results or unhandled table
+            is_unsupported = any(kw in t_up for kw in unsupported_structural_keywords)
+            if tbl.rows:
+                if is_unsupported:
+                    if not allow_partial_import:
+                        raise ValueError(
+                            f"File contains unsupported table {tname!r} ({len(tbl.rows)} rows). "
+                            f"Set allow_partial_import=True to proceed with partial model."
+                        )
+                    else:
+                        self.messages.append(f"TABLE {tname} ({len(tbl.rows)} rows) was not imported")
+                        self.dropped_items.append(tname)
+                else:
+                    self.messages.append(f"TABLE {tname} ({len(tbl.rows)} rows) was not imported")
+                    self.dropped_items.append(tname)
+
         nodes: List[Node] = []
         supports: List[Support] = []
         materials: List[ElasticMaterial] = []
@@ -121,6 +332,30 @@ class CsiFileReader(BaseModelReader):
                 y = float(row.get("Y", 0.0))
                 z = float(row.get("Z", 0.0))
                 nodes.append(Node(id=jid, x=x, y=y, z=z))
+
+        # 1b. Joint Added Mass Assignments
+        mass_table = tables.get("JOINT ADDED MASS ASSIGNMENTS") or tables.get("POINT ADDED MASS ASSIGNMENTS")
+        if mass_table:
+            node_map = {str(n.id): n for n in nodes}
+            for row in mass_table.rows:
+                jid = str(row.get("Joint", row.get("Point", "")))
+                if jid in node_map:
+                    n = node_map[jid]
+                    u1 = float(row.get("Mass1", row.get("U1", row.get("MassX", 0.0))) or 0.0)
+                    u2 = float(row.get("Mass2", row.get("U2", row.get("MassY", 0.0))) or 0.0)
+                    u3 = float(row.get("Mass3", row.get("U3", row.get("MassZ", 0.0))) or 0.0)
+                    if abs(u1 - u2) > 1e-6 or abs(u2 - u3) > 1e-6:
+                        if not allow_partial_import:
+                            raise ValueError(
+                                f"Joint {jid!r} has non-isotropic directional added mass (U1={u1}, U2={u2}, U3={u3}). "
+                                f"Set allow_partial_import=True to average directional masses."
+                            )
+                        else:
+                            avg_mass = (u1 + u2 + u3) / 3.0
+                            n.mass = (getattr(n, "mass", 0.0) or 0.0) + avg_mass
+                            self.messages.append(f"Joint {jid!r} non-isotropic mass averaged to {avg_mass:g}")
+                    else:
+                        n.mass = (getattr(n, "mass", 0.0) or 0.0) + u1
 
         # 2. Restraints -> Supports
         # Supported tables: "JOINT RESTRAINT ASSIGNMENTS", "POINT ASSIGNMENTS - RESTRAINTS", "JOINT RESTRAINTS"
@@ -158,6 +393,28 @@ class CsiFileReader(BaseModelReader):
                         "sym_type": str(row.get("SymType", "")),
                     }
 
+        def _float(row: Dict[str, Any], *keys: str) -> Optional[float]:
+            for key in keys:
+                if row.get(key) is not None:
+                    try:
+                        return float(row[key])
+                    except (ValueError, TypeError):
+                        return None
+            return None
+
+        # Design strengths: concrete f'c (03B), rebar Fy / Fu (03E), and steel Fy / Fu (03A)
+        strengths: Dict[str, Dict[str, Optional[float]]] = {}
+        for name in (
+            "MATERIAL PROPERTIES 03A - STEEL DATA",
+            "MATERIAL PROPERTIES 03B - CONCRETE DATA",
+            "MATERIAL PROPERTIES 03E - REBAR DATA",
+        ):
+            table = tables.get(name)
+            for row in (table.rows if table else []):
+                mid = str(row.get("Material", ""))
+                if mid:
+                    strengths[mid] = {"fc": _float(row, "Fc"), "fy": _float(row, "Fy"), "fu": _float(row, "Fu")}
+
         mat_table = (
             tables.get("MATERIAL PROPERTIES 02 - BASIC MECHANICAL PROPERTIES")
             or tables.get("MATERIAL PROPERTIES - GENERAL")
@@ -168,30 +425,37 @@ class CsiFileReader(BaseModelReader):
                 mid = str(row.get("Material", row.get("MatName", "")))
                 if not mid:
                     continue
-                E = float(row.get("E1", row.get("E", 2.9e7)))
-                nu = float(row.get("U12", row.get("Nu", 0.3)))
-                rho = float(row.get("UnitMass", row.get("MassDensity", 0.0)))
-                unit_weight = None
-                if "UnitWeight" in row and row["UnitWeight"] is not None:
-                    try:
-                        unit_weight = float(row["UnitWeight"])
-                    except (ValueError, TypeError):
-                        pass
-                m_type = mat_info.get(mid, {}).get("type")
-                materials.append(ElasticMaterial(id=mid, name=m_type, E=E, nu=nu, rho=rho, unit_weight=unit_weight))
+                strength = strengths.get(mid, {})
+                raw_mass = _float(row, "UnitMass", "MassDensity")
+                rho_val = (raw_mass / model_units.consistent_mass_factor) if raw_mass is not None else None
+                materials.append(_csi_material(
+                    mid, mat_info.get(mid, {}).get("type"),
+                    E=_float(row, "E1", "E"), nu=_float(row, "U12", "Nu"),
+                    unit_weight=_float(row, "UnitWeight"), rho=rho_val,
+                    fc=strength.get("fc"), fy=strength.get("fy"), fu=strength.get("fu"), messages=self.messages,
+                ))
 
-        if not materials:
-            if (
-                tables.get("FRAME SECTION PROPERTIES 01 - GENERAL")
-                or tables.get("FRAME SECTION PROPERTIES")
-                or tables.get("FRAME SECTIONS")
-                or tables.get("CONNECTIVITY - FRAME")
-                or tables.get("LINE CONNECTIVITY")
-            ):
-                materials.append(ElasticMaterial(id="CONC", name="Concrete", E=2.5e7, nu=0.2, rho=2400.0 / 9.80665, unit_weight=24.0))
+        # 4. Frame Sections (each with its material) and the reinforcement of concrete sections: bar materials, and the
+        # clear cover to the ties of columns (SAP2000 "Cover"). A beam's TopCover / BotCover is measured to the bar
+        # centroid, not clear cover, so beams keep no cover (set it before a code design).
+        concrete_sections: Dict[str, Dict[str, Any]] = {}
+        for name, is_column in (("FRAME SECTION PROPERTIES 02 - CONCRETE COLUMN", True),
+                                ("FRAME SECTION PROPERTIES 03 - CONCRETE BEAM", False)):
+            table = tables.get(name)
+            for row in (table.rows if table else []):
+                sname = str(row.get("SectionName", ""))
+                if not sname:
+                    continue
+                entry: Dict[str, Any] = {}
+                if row.get("RebarMatL"):
+                    entry["rebar_material_id"] = str(row["RebarMatL"])
+                if row.get("RebarMatC"):
+                    entry["transverse_rebar_material_id"] = str(row["RebarMatC"])
+                cover = _float(row, "Cover") if is_column else None
+                if cover is not None and cover > 0.0:
+                    entry["cover"] = cover
+                concrete_sections[sname] = entry
 
-        # 4. Frame Sections
-        sec_mat_map: Dict[str, str] = {}
         sec_table = (
             tables.get("FRAME SECTION PROPERTIES 01 - GENERAL")
             or tables.get("FRAME SECTION PROPERTIES")
@@ -203,8 +467,6 @@ class CsiFileReader(BaseModelReader):
                 if not sname:
                     continue
                 mat_name = str(row.get("Material", row.get("MatName", "")))
-                if mat_name:
-                    sec_mat_map[sname] = mat_name
 
                 shape = str(row.get("Shape", "")).upper()
                 t3 = float(row.get("t3", row.get("Depth", 0.0)))
@@ -217,25 +479,26 @@ class CsiFileReader(BaseModelReader):
                 as2 = float(row.get("AS2", row.get("As2", 0.0)))
                 as3 = float(row.get("AS3", row.get("As3", 0.0)))
 
+                if not mat_name:
+                    raise ValueError(f"CSI frame section {sname!r} names no material.")
+                reinforcement = concrete_sections.get(sname, {})
                 if shape == "RECTANGULAR" or (t3 > 0 and t2 > 0 and shape in ("", "CONCRETE", "RECT")):
-                    sections.append(RectangularSection(id=sname, b=t2, h=t3))
+                    sections.append(RectangularSection(id=sname, material_id=mat_name, b=t2, h=t3, **reinforcement))
                 elif shape == "CIRCULAR" or (t3 > 0 and shape == "CIRCLE"):
-                    sections.append(CircularSection(id=sname, d=t3))
+                    sections.append(CircularSection(id=sname, material_id=mat_name, d=t3, **reinforcement))
                 else:
                     sections.append(
                         GeneralSection(
                             id=sname,
+                            material_id=mat_name,
                             A=A if A > 0 else 1.0,
-                            Iz=I33 if I33 > 0 else 1.0,
-                            Iy=I22 if I22 > 0 else 1.0,
+                            I3=I33 if I33 > 0 else 1.0,
+                            I2=I22 if I22 > 0 else 1.0,
                             J=J if J > 0 else 1.0,
                             As2=as2 if as2 > 0 else None,
                             As3=as3 if as3 > 0 else None,
                         )
                     )
-
-        if not sections:
-            sections.append(RectangularSection(id="DEFAULT_SEC", b=0.4, h=0.4))
 
         # Check for section assignments
         frame_sec_map: Dict[str, str] = {}
@@ -250,9 +513,6 @@ class CsiFileReader(BaseModelReader):
         # 5. Connectivity -> Elements
         # Supported tables: "CONNECTIVITY - FRAME" (SAP2000) or "LINE CONNECTIVITY" (ETABS)
         conn_table = tables.get("CONNECTIVITY - FRAME") or tables.get("LINE CONNECTIVITY")
-        default_mat_id = materials[0].id
-        default_sec_id = sections[0].id
-        valid_mat_ids = {m.id for m in materials}
 
         # Parse Local Axes Assignments
         frame_angle_map: Dict[str, float] = {}
@@ -271,6 +531,70 @@ class CsiFileReader(BaseModelReader):
                     except (ValueError, TypeError):
                         pass
 
+        # 4b. Frame Property Modifiers
+        mod_table = tables.get("FRAME PROPERTY MODIFIERS") or tables.get("LINE PROPERTY MODIFIERS")
+        prop_mods: Dict[str, Dict[str, float]] = {}
+        if mod_table:
+            for row in mod_table.rows:
+                fid = str(row.get("Frame", row.get("Line", "")))
+                mods = {}
+                col_map = [
+                    (("A", "AMod"), "A"),
+                    (("A2", "As2", "A2Mod", "As2Mod"), "As2"),
+                    (("A3", "As3", "A3Mod", "As3Mod"), "As3"),
+                    (("J", "JMod"), "J"),
+                    (("I2", "I2Mod"), "I2"),
+                    (("I3", "I3Mod"), "I3"),
+                    (("Mass", "MassMod", "mass"), "mass"),
+                    (("Weight", "WeightMod", "weight"), "weight"),
+                ]
+                for cols, key in col_map:
+                    for col in cols:
+                        if col in row and row[col] is not None:
+                            try:
+                                v = float(row[col])
+                                if abs(v - 1.0) > 1e-6:
+                                    mods[key] = v
+                                break
+                            except (ValueError, TypeError):
+                                pass
+                if mods:
+                    prop_mods[fid] = mods
+
+        # Parse Frame Releases (member-local P, V2, V3, T, M2, M3)
+        frame_releases_map: Dict[str, Tuple[List[bool], List[bool]]] = {}
+        rel_table = (
+            tables.get("FRAME RELEASE ASSIGNMENTS 1 - GENERAL")
+            or tables.get("FRAME RELEASE ASSIGNMENTS")
+            or tables.get("FRAME RELEASES")
+        )
+        if rel_table:
+            for row in rel_table.rows:
+                fid = str(row.get("Frame", row.get("Line", "")))
+                if fid:
+                    def _is_rel(val):
+                        if isinstance(val, bool):
+                            return val
+                        return str(val or "").strip().lower() in ("yes", "true", "1", "y")
+
+                    ri = [
+                        _is_rel(row.get("PI")),
+                        _is_rel(row.get("V2I")),
+                        _is_rel(row.get("V3I")),
+                        _is_rel(row.get("TI")),
+                        _is_rel(row.get("M2I")),
+                        _is_rel(row.get("M3I")),
+                    ]
+                    rj = [
+                        _is_rel(row.get("PJ")),
+                        _is_rel(row.get("V2J")),
+                        _is_rel(row.get("V3J")),
+                        _is_rel(row.get("TJ")),
+                        _is_rel(row.get("M2J")),
+                        _is_rel(row.get("M3J")),
+                    ]
+                    frame_releases_map[fid] = (ri, rj)
+
         nodes_dict = {str(n.id): n for n in nodes}
 
         if conn_table:
@@ -280,10 +604,9 @@ class CsiFileReader(BaseModelReader):
                 jj = str(row.get("JointJ", row.get("PointJ", "")))
                 if not fid or not ji or not jj:
                     continue
-                sec_id = row.get("SectionName") or frame_sec_map.get(fid, default_sec_id)
-                mat_id = sec_mat_map.get(sec_id, default_mat_id)
-                if mat_id not in valid_mat_ids:
-                    mat_id = default_mat_id
+                sec_id = row.get("SectionName") or frame_sec_map.get(fid)
+                if sec_id is None:
+                    raise ValueError(f"CSI frame {fid!r} has no section assignment.")
 
                 # Calculate roll_angle from CSI Angle
                 # In fem3d:
@@ -310,14 +633,19 @@ class CsiFileReader(BaseModelReader):
                 if abs(roll_angle) < 1e-6:
                     roll_angle = 0.0
 
+                rel_i, rel_j = frame_releases_map.get(fid, ([False] * 6, [False] * 6))
                 elements.append(
                     BeamElement(
                         id=fid,
                         start_node=ji,
                         end_node=jj,
-                        material_id=mat_id,
                         section_id=sec_id,
+                        # CSI frames are Timoshenko members (shear areas AS2/AS3), as in the ETABS reader
+                        include_shear_deformation=True,
                         roll_angle=roll_angle,
+                        release_i=rel_i,
+                        release_j=rel_j,
+                        stiffness_modifiers=prop_mods.get(fid),
                     )
                 )
 
@@ -365,6 +693,8 @@ class CsiFileReader(BaseModelReader):
             if jt_loads_table:
                 for row in jt_loads_table.rows:
                     jid = str(row.get("Joint", row.get("Point", "")))
+                    if not jid:
+                        continue
                     pat = str(row.get("LoadPat", row.get("LoadCase", "DEAD")))
                     if pat not in load_cases_dict:
                         load_cases_dict[pat] = LoadCase(id=pat)
@@ -496,23 +826,108 @@ class CsiFileReader(BaseModelReader):
                         f"Unsupported load direction '{dir_name}' (coordinate system '{csys}') in CSI file."
                     )
 
+                # Span positions
+                rel_a = float(row.get("RelDistA", row.get("DistA", 0.0)) or 0.0)
+                rel_b = float(row.get("RelDistB", row.get("DistB", 1.0)) or 1.0)
+                if rel_a > rel_b:
+                    rel_a, rel_b = rel_b, rel_a
+                if abs(rel_a - rel_b) < 1e-6:
+                    rel_a = 0.0
+                    rel_b = 1.0
+
                 load_kwargs = {
                     "element_id": fid,
                     "wx": wx,
                     "wy": wy,
                     "wz": wz,
+                    "start": rel_a,
+                    "end": rel_b,
                     "is_local": is_local,
                 }
                 if is_local:
                     load_kwargs["w1"] = w1
                     load_kwargs["w2"] = w2
                     load_kwargs["w3"] = w3
-                if val_a != val_b:
-                    load_kwargs["w_start"] = w_start
-                    load_kwargs["w_end"] = w_end
+                    if val_a != val_b:
+                        if abs(w1) > 1e-6: load_kwargs["w1_end"] = w_end
+                        if abs(w2) > 1e-6: load_kwargs["w2_end"] = w_end
+                        if abs(w3) > 1e-6: load_kwargs["w3_end"] = w_end
+                else:
+                    if val_a != val_b:
+                        if abs(wx) > 1e-6: load_kwargs["wx_end"] = w_end
+                        if abs(wy) > 1e-6: load_kwargs["wy_end"] = w_end
+                        if abs(wz) > 1e-6: load_kwargs["wz_end"] = w_end
 
                 load_cases_dict[pat].element_loads.append(
                     DistributedLoad(**load_kwargs)
+                )
+
+        # 8b. Frame / Line Point Loads -> ElementPointLoad
+        frm_pt_table = tables.get("FRAME LOADS - POINT") or tables.get("LINE LOADS - POINT")
+        if frm_pt_table:
+            for row in frm_pt_table.rows:
+                fid = str(row.get("Frame", row.get("Line", "")))
+                pat = str(row.get("LoadPat", "DEAD"))
+                if pat not in load_cases_dict:
+                    load_cases_dict[pat] = LoadCase(id=pat)
+
+                csys = str(row.get("CoordSys", "GLOBAL")).strip().upper()
+                ltype = str(row.get("Type", "Force")).strip().upper()
+                dir_name = str(row.get("Dir", "Gravity")).strip().upper()
+                pos = float(row.get("RelDist", row.get("Dist", 0.0)) or 0.0)
+                val = float(row.get("PointLoad", row.get("Force", row.get("Val", 0.0))) or 0.0)
+
+                is_loc = (csys == "LOCAL")
+                fx = fy = fz = mx = my = mz = 0.0
+
+                if ltype == "MOMENT":
+                    if dir_name in ("1", "+1") or (is_loc and dir_name in ("X", "+X")):
+                        mx = val; is_loc = True
+                    elif dir_name in ("-1",) or (is_loc and dir_name in ("-X",)):
+                        mx = -val; is_loc = True
+                    elif dir_name in ("2", "+2") or (is_loc and dir_name in ("Y", "+Y")):
+                        my = val; is_loc = True
+                    elif dir_name in ("-2",) or (is_loc and dir_name in ("-Y",)):
+                        my = -val; is_loc = True
+                    elif dir_name in ("3", "+3") or (is_loc and dir_name in ("Z", "+Z")):
+                        mz = val; is_loc = True
+                    elif dir_name in ("-3",) or (is_loc and dir_name in ("-Z",)):
+                        mz = -val; is_loc = True
+                    elif dir_name in ("Z", "+Z"): mz = val
+                    elif dir_name in ("-Z",): mz = -val
+                    elif dir_name in ("Y", "+Y"): my = val
+                    elif dir_name in ("-Y",): my = -val
+                    elif dir_name in ("X", "+X"): mx = val
+                    elif dir_name in ("-X",): mx = -val
+                else:  # Force
+                    if "GRAV" in dir_name: fz = -abs(val)
+                    elif dir_name in ("Z", "+Z"): fz = val
+                    elif dir_name in ("-Z",): fz = -val
+                    elif dir_name in ("Y", "+Y"): fy = val
+                    elif dir_name in ("-Y",): fy = -val
+                    elif dir_name in ("X", "+X"): fx = val
+                    elif dir_name in ("-X",): fx = -val
+                    elif dir_name in ("1", "+1") or (is_loc and dir_name in ("X", "+X")):
+                        fx = val; is_loc = True
+                    elif dir_name in ("-1",) or (is_loc and dir_name in ("-X",)):
+                        fx = -val; is_loc = True
+                    elif dir_name in ("2", "+2") or (is_loc and dir_name in ("Y", "+Y")):
+                        fy = val; is_loc = True
+                    elif dir_name in ("-2",) or (is_loc and dir_name in ("-Y",)):
+                        fy = -val; is_loc = True
+                    elif dir_name in ("3", "+3") or (is_loc and dir_name in ("Z", "+Z")):
+                        fz = val; is_loc = True
+                    elif dir_name in ("-3",) or (is_loc and dir_name in ("-Z",)):
+                        fz = -val; is_loc = True
+
+                load_cases_dict[pat].element_point_loads.append(
+                    ElementPointLoad(
+                        element_id=fid,
+                        position=pos,
+                        fx=fx, fy=fy, fz=fz,
+                        mx=mx, my=my, mz=mz,
+                        is_local=is_loc,
+                    )
                 )
 
         # 9. Mass Source
@@ -539,6 +954,8 @@ class CsiFileReader(BaseModelReader):
                 include_element_mass=inc_elem,
                 factors=factors,
             )
+        else:
+            mass_source = _csi_default_mass_source()
 
         # 10. Modal Analysis Cases
         analysis_cases = []
@@ -582,6 +999,31 @@ class CsiFileReader(BaseModelReader):
                     )
                 )
 
+        # 11. Combinations
+        combo_table = tables.get("COMBINATION DEFINITIONS") or tables.get("LOAD COMBINATION DEFINITIONS")
+        combinations_list: List[LoadCombination] = []
+        if combo_table:
+            comb_dict: Dict[str, LoadCombination] = {}
+            for row in combo_table.rows:
+                cname = str(row.get("ComboName", row.get("CombinationName", ""))).strip()
+                case_name = str(row.get("CaseName", row.get("LoadName", ""))).strip()
+                sf = float(row.get("ScaleFactor", row.get("Factor", row.get("SF", 1.0))) or 1.0)
+                ctype = str(row.get("ComboType", row.get("DesignType", ""))).upper()
+                kind = "service" if "SERVICE" in ctype else "strength"
+                if not cname or not case_name:
+                    continue
+                if cname not in comb_dict:
+                    comb_dict[cname] = LoadCombination(
+                        id=cname,
+                        name=cname,
+                        kind=kind,
+                        method="ASD" if kind == "service" else "LRFD",
+                        factors=[LoadCaseFactor(load_case_id=case_name, factor=sf)],
+                    )
+                else:
+                    comb_dict[cname].factors.append(LoadCaseFactor(load_case_id=case_name, factor=sf))
+            combinations_list = list(comb_dict.values())
+
         return StructuralModel(
             nodes=nodes,
             elements=elements,
@@ -589,28 +1031,73 @@ class CsiFileReader(BaseModelReader):
             sections=sections,
             supports=supports,
             load_cases=list(load_cases_dict.values()),
+            load_combinations=combinations_list,
             analysis_cases=analysis_cases,
             mass_source=mass_source,
             mass_sources=[mass_source] if mass_source else [],
         )
 
-    def _build_project_from_dollar_e2k(self, content: str, title: Optional[str] = None) -> Project:
+    def _build_project_from_dollar_e2k(
+        self,
+        content: str,
+        title: Optional[str] = None,
+        allow_partial_import: bool = False,
+    ) -> Project:
         """Parse native ETABS text data ($ SECTION command syntax) into a Project."""
         sections: Dict[str, List[str]] = {}
         current_sec: Optional[str] = None
+        elem_id_map: Dict[Tuple[str, str], str] = {}
         for line in content.splitlines():
             stripped = line.strip()
-            if stripped.startswith("$"):
+            if stripped.startswith("; ELEM_MAP"):
+                parts = stripped.split()
+                if len(parts) >= 4:
+                    elem_id_map[(parts[2], parts[3])] = parts[1]
+            elif stripped.startswith("$"):
                 current_sec = stripped[1:].strip().upper()
                 sections[current_sec] = []
             elif current_sec and stripped:
                 sections[current_sec].append(stripped)
 
+        # Check for unhandled or unsupported sections (F1 / F6)
+        handled_dollar_sections = {
+            "PROGRAM",
+            "CONTROLS",
+            "STORIES - IN SEQUENCE FROM TOP",
+            "MATERIAL PROPERTIES",
+            "CONCRETE SECTIONS",
+            "FRAME SECTIONS",
+            "POINT COORDINATES",
+            "POINT ASSIGNS",
+            "LINE CONNECTIVITIES",
+            "LINE ASSIGNS",
+            "LOAD PATTERNS",
+            "POINT OBJECT LOADS",
+            "FRAME OBJECT LOADS",
+            "MASS SOURCE",
+            "LOAD CASES",
+        }
+        for sec_name, sec_lines in sections.items():
+            s_up = sec_name.upper()
+            is_unsupported = any(
+                kw in s_up for kw in ("SPRING", "OFFSET", "CONSTRAINT", "DIAPHRAGM", "AREA")
+            )
+            if is_unsupported and sec_lines:
+                if not allow_partial_import:
+                    raise ValueError(
+                        f"File contains unsupported section ${sec_name} ({len(sec_lines)} lines). "
+                        f"Set allow_partial_import=True to import the supported model elements anyway."
+                    )
+                else:
+                    self.messages.append(f"SECTION ${sec_name} ({len(sec_lines)} lines) was not imported")
+            elif s_up not in handled_dollar_sections:
+                self.messages.append(f"SECTION ${sec_name} ({len(sec_lines)} lines) was not imported")
+
         model = StructuralModel()
         project = Project(model=model)
 
         # 1. Controls / Units
-        units_str = "kN, m"
+        units_str = None
         ctrl_lines = sections.get("CONTROLS", [])
         for l in ctrl_lines:
             tokens = shlex.split(l)
@@ -621,15 +1108,17 @@ class CsiFileReader(BaseModelReader):
             if tokens and tokens[0].upper() == "TITLE1" and not title:
                 title = tokens[1]
 
+        if not units_str:
+            raise ValueError("The file states no units (CONTROLS / UNITS)")
+
         if title:
             project.metadata.title = title
         try:
             from struct_core import parse_units
             parsed_units = parse_units(units_str)
-            project.metadata.units = parsed_units
-            model.units = parsed_units
-        except Exception:
-            model.units = units_str
+            project.units = parsed_units
+        except Exception as exc:
+            raise ValueError(f"The file states no units (CONTROLS / UNITS): {exc}")
 
         # 2. Stories
         story_lines = sections.get("STORIES - IN SEQUENCE FROM TOP", [])
@@ -659,36 +1148,48 @@ class CsiFileReader(BaseModelReader):
             story_elev[sname] = curr_z
         model.story_elevations = [story_elev[s] for s in story_order if s != "Base"]
 
-        # 3. Materials
+        # 3. Materials: only the properties the file states (in its units); no mass density is derived, the weight
+        # per volume carries the self-weight
         mat_lines = sections.get("MATERIAL PROPERTIES", [])
         mat_dict: Dict[str, Dict[str, Any]] = {}
+        numeric = {"WEIGHTPERVOLUME": "unit_weight", "E": "E", "U": "nu", "FC": "fc", "FY": "fy", "FU": "fu"}
         for l in mat_lines:
             tokens = shlex.split(l)
             if len(tokens) >= 2 and tokens[0].upper() == "MATERIAL":
                 mid = tokens[1]
-                if mid not in mat_dict:
-                    mat_dict[mid] = {"id": mid, "E": 30.0e6, "nu": 0.2, "unit_weight": 24.0}
-                for i in range(2, len(tokens)):
+                entry = mat_dict.setdefault(mid, {})
+                for i in range(2, len(tokens) - 1):
                     key = tokens[i].upper()
-                    if key == "WEIGHTPERVOLUME" and i + 1 < len(tokens):
-                        mat_dict[mid]["unit_weight"] = float(tokens[i + 1])
-                    elif key == "E" and i + 1 < len(tokens):
-                        mat_dict[mid]["E"] = float(tokens[i + 1])
-                    elif key == "U" and i + 1 < len(tokens):
-                        mat_dict[mid]["nu"] = float(tokens[i + 1])
-                    elif key == "FC" and i + 1 < len(tokens):
-                        mat_dict[mid]["fc"] = float(tokens[i + 1])
+                    if key == "TYPE":
+                        entry["type"] = tokens[i + 1]
+                    elif key in numeric and numeric[key] not in entry:
+                        try:
+                            entry[numeric[key]] = float(tokens[i + 1])
+                        except ValueError:
+                            pass
 
         for mid, mdata in mat_dict.items():
-            mat = ElasticMaterial(
-                id=mid,
-                E=mdata["E"],
-                nu=mdata["nu"],
-                unit_weight=mdata["unit_weight"],
-                rho=mdata["unit_weight"] / 9.80665,
-            )
-            model.materials.append(mat)
-        default_mat_id = model.materials[0].id if model.materials else "CONC"
+            model.materials.append(_csi_material(
+                mid, mdata.get("type"), E=mdata.get("E"), nu=mdata.get("nu"), unit_weight=mdata.get("unit_weight"),
+                fc=mdata.get("fc"), fy=mdata.get("fy"), fu=mdata.get("fu"), messages=self.messages,
+            ))
+
+        # Reinforcement of concrete sections: bar materials, and the clear cover to the confinement bars of columns
+        # (ETABS COVER). A beam's COVERTOP / COVERBOTTOM is measured to the bar centroid, not clear cover, so beams
+        # keep no cover (set it before a code design).
+        concrete_sections: Dict[str, Dict[str, Any]] = {}
+        for l in sections.get("CONCRETE SECTIONS", []):
+            tokens = shlex.split(l)
+            if len(tokens) >= 2 and tokens[0].upper() == "CONCRETESECTION":
+                values = {tokens[i].upper(): tokens[i + 1] for i in range(2, len(tokens) - 1)}
+                entry: Dict[str, Any] = {}
+                if "LONGBARMATERIAL" in values:
+                    entry["rebar_material_id"] = values["LONGBARMATERIAL"]
+                if "CONFINEBARMATERIAL" in values:
+                    entry["transverse_rebar_material_id"] = values["CONFINEBARMATERIAL"]
+                if values.get("TYPE", "").upper() == "COLUMN" and "COVER" in values:
+                    entry["cover"] = float(values["COVER"])
+                concrete_sections[tokens[1]] = entry
 
         # 4. Frame Sections
         sec_lines = sections.get("FRAME SECTIONS", [])
@@ -696,21 +1197,21 @@ class CsiFileReader(BaseModelReader):
             tokens = shlex.split(l)
             if len(tokens) >= 2 and tokens[0].upper() == "FRAMESECTION":
                 sec_id = tokens[1]
-                shape = "RECTANGULAR"
-                d = 0.4
-                b = 0.3
-                for i in range(2, len(tokens)):
-                    key = tokens[i].upper()
-                    if key == "SHAPE" and i + 1 < len(tokens):
-                        shape = tokens[i + 1].upper()
-                    elif key == "D" and i + 1 < len(tokens):
-                        d = float(tokens[i + 1])
-                    elif key == "B" and i + 1 < len(tokens):
-                        b = float(tokens[i + 1])
+                values = {tokens[i].upper(): tokens[i + 1] for i in range(2, len(tokens) - 1)}
+                shape = values.get("SHAPE", "").upper()
+                material_id = values.get("MATERIAL")
+                if material_id is None:
+                    raise ValueError(f"ETABS frame section {sec_id!r} names no material.")
+                reinforcement = concrete_sections.get(sec_id, {})
                 if "RECT" in shape:
-                    model.sections.append(RectangularSection(id=sec_id, b=b, h=d))
+                    model.sections.append(RectangularSection(
+                        id=sec_id, material_id=material_id, b=float(values["B"]), h=float(values["D"]), **reinforcement))
                 elif "CIRC" in shape:
-                    model.sections.append(CircularSection(id=sec_id, d=d))
+                    model.sections.append(CircularSection(
+                        id=sec_id, material_id=material_id, d=float(values["D"]), **reinforcement))
+                else:
+                    self.messages.append(f"Frame section {sec_id!r} ({values.get('SHAPE')}) is not imported: only "
+                                         f"rectangular and circular shapes are supported.")
 
         # 5. Plan Points
         pt_lines = sections.get("POINT COORDINATES", [])
@@ -749,7 +1250,7 @@ class CsiFileReader(BaseModelReader):
 
         # 8. Line Assigns
         assign_lines = sections.get("LINE ASSIGNS", [])
-        line_assigns: List[Tuple[str, str, str, float]] = []
+        line_assigns: List[Tuple[str, str, str, float, List[bool], List[bool]]] = []
         for l in assign_lines:
             tokens = shlex.split(l)
             if len(tokens) >= 3 and tokens[0].upper() == "LINEASSIGN":
@@ -757,17 +1258,37 @@ class CsiFileReader(BaseModelReader):
                 st_name = tokens[2]
                 sec_id = ""
                 ang = 0.0
+                rel_i = [False] * 6
+                rel_j = [False] * 6
                 for i in range(3, len(tokens)):
                     key = tokens[i].upper()
                     if key == "SECTION" and i + 1 < len(tokens):
                         sec_id = tokens[i + 1]
                     elif key == "ANG" and i + 1 < len(tokens):
                         ang = float(tokens[i + 1])
-                line_assigns.append((lname, st_name, sec_id, ang))
+                    elif key == "RELEASE" and i + 1 < len(tokens):
+                        rel_toks = set(tokens[i + 1].upper().split())
+                        rel_i = [
+                            "PI" in rel_toks,
+                            "V2I" in rel_toks,
+                            "V3I" in rel_toks,
+                            "TI" in rel_toks,
+                            "M2I" in rel_toks,
+                            "M3I" in rel_toks,
+                        ]
+                        rel_j = [
+                            "PJ" in rel_toks,
+                            "V2J" in rel_toks,
+                            "V3J" in rel_toks,
+                            "TJ" in rel_toks,
+                            "M2J" in rel_toks,
+                            "M3J" in rel_toks,
+                        ]
+                line_assigns.append((lname, st_name, sec_id, ang, rel_i, rel_j))
 
         # 9. Create 3D Nodes
         needed_nodes = set(restr_map.keys())
-        for (lname, st_name, _, _) in line_assigns:
+        for (lname, st_name, _, _, _, _) in line_assigns:
             if lname in line_conn:
                 ltype, pti, ptj = line_conn[lname]
                 needed_nodes.add((pti, st_name))
@@ -810,7 +1331,7 @@ class CsiFileReader(BaseModelReader):
         # 10. Create Elements
         elem_counter = 1
         elem_lookup: Dict[Tuple[str, str], int] = {}
-        for lname, st_name, sec_id, ang in line_assigns:
+        for lname, st_name, sec_id, ang, rel_i, rel_j in line_assigns:
             if lname not in line_conn:
                 continue
             ltype, pti, ptj = line_conn[lname]
@@ -822,14 +1343,16 @@ class CsiFileReader(BaseModelReader):
                 n_start = node_id_map[(pti, bot_st)]
                 n_end = node_id_map[(ptj if ltype == "BRACE" else pti, st_name)]
                 eff_ang = (ang - 90.0 + 180.0) % 360.0 - 180.0 if ltype == "COLUMN" else ang
+                orig_eid = elem_id_map.get((lname, st_name), elem_counter)
                 elem = BeamElement(
-                    id=elem_counter,
+                    id=orig_eid,
                     start_node=n_start,
                     end_node=n_end,
-                    material_id=default_mat_id,
                     section_id=sec_id,
                     include_shear_deformation=True,
                     roll_angle=eff_ang,
+                    release_i=rel_i,
+                    release_j=rel_j,
                 )
                 model.elements.append(elem)
                 elem_lookup[(lname, st_name)] = elem_counter
@@ -839,14 +1362,16 @@ class CsiFileReader(BaseModelReader):
                     continue
                 n_start = node_id_map[(pti, st_name)]
                 n_end = node_id_map[(ptj, st_name)]
+                orig_eid = elem_id_map.get((lname, st_name), elem_counter)
                 elem = BeamElement(
-                    id=elem_counter,
+                    id=orig_eid,
                     start_node=n_start,
                     end_node=n_end,
-                    material_id=default_mat_id,
                     section_id=sec_id,
                     include_shear_deformation=True,
                     roll_angle=ang,
+                    release_i=rel_i,
+                    release_j=rel_j,
                 )
                 model.elements.append(elem)
                 elem_lookup[(lname, st_name)] = elem_counter
@@ -964,7 +1489,9 @@ class CsiFileReader(BaseModelReader):
                 include_element_mass=inc_elem,
                 factors=factors,
             )
-            model.mass_sources = [model.mass_source]
+        else:
+            model.mass_source = _csi_default_mass_source()
+        model.mass_sources = [model.mass_source]
 
         # 15. Load Cases (Modal & Response Spectrum)
         case_lines = sections.get("LOAD CASES", [])
@@ -999,13 +1526,14 @@ class CsiFileReader(BaseModelReader):
                     from struct_load import LoadGenerator, SeismicParameters
                     sparams = lc.seismic_params or {}
                     s_obj = SeismicParameters(
-                        sds=float(sparams.get("sds", sparams.get("z", 1.0))),
-                        sd1=float(sparams.get("sd1", 0.4)),
-                        s1=float(sparams.get("s1", 0.35)),
-                        tl=float(sparams.get("tl", 8.0)),
-                        r_factor=float(sparams.get("r", sparams.get("r_factor", 8.0))),
-                        importance_factor=float(sparams.get("i", sparams.get("importance_factor", 1.0))),
+                        sds=float(sparams.get("sds") or sparams.get("z") or 1.0),
+                        sd1=float(sparams.get("sd1") or 0.4),
+                        s1=float(sparams.get("s1") or 0.35),
+                        tl=float(sparams.get("tl") or 8.0),
+                        r_factor=float(sparams.get("r") or sparams.get("r_factor") or 8.0),
+                        importance_factor=float(sparams.get("i") or sparams.get("importance_factor") or 1.0),
                         site_class=str(sparams.get("siteclass", sparams.get("site_class", sparams.get("s", "D")))),
+                        risk_category=str(sparams.get("risk_category", "II")),
                     )
                     dir_str = str(sparams.get("dir", "X")).upper()
                     direction = "Y" if "Y" in dir_str and "X" not in dir_str else "X"

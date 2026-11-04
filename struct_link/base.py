@@ -28,13 +28,18 @@ class BaseModelReader(ABC):
     """Abstract base class for importing external models into struct_core."""
 
     @abstractmethod
-    def read_model(self, source: Union[str, Path]) -> StructuralModel:
+    def read_model(self, source: Union[str, Path], allow_partial_import: bool = False) -> StructuralModel:
         """Parse source file/data into a StructuralModel."""
         raise NotImplementedError
 
-    def read_project(self, source: Union[str, Path], title: Optional[str] = None) -> Project:
+    def read_project(
+        self,
+        source: Union[str, Path],
+        title: Optional[str] = None,
+        allow_partial_import: bool = False,
+    ) -> Project:
         """Convenience method to parse and wrap in a struct_core.Project."""
-        model = self.read_model(source)
+        model = self.read_model(source, allow_partial_import=allow_partial_import)
         project = Project(model=model)
         if title:
             project.metadata.title = title
@@ -53,6 +58,7 @@ class BaseModelWriter(ABC):
         self,
         model_or_project: Union[StructuralModel, Project],
         target_path: Union[str, Path],
+        allow_partial_export: bool = False,
     ) -> Path:
         """Write a StructuralModel or Project to the target file."""
         raise NotImplementedError

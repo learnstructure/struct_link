@@ -1,6 +1,6 @@
 ; CSI ETABS Text File
 TABLE:  "PROGRAM INFORMATION"
-   ProgramName=ETABS   Version=21.0.0   ProgLevel=Ultimate
+   ProgramName=ETABS   Version=21.0.0   ProgLevel=Ultimate   CurrUnits="KN, m, C"
 
 TABLE:  "POINT COORDINATES"
    Point=1   X=0   Y=0   Z=0
@@ -16,8 +16,8 @@ TABLE:  "MATERIAL PROPERTIES - GENERAL"
    Material=C30   Type=Concrete   E=30000000   Nu=0.2   UnitMass=2500
 
 TABLE:  "FRAME SECTION PROPERTIES"
-   SectionName=COL   Shape=Rectangular   t3=0.45   t2=0.45   Area=0.2025
-   SectionName=BEAM   Shape=Rectangular   t3=0.55   t2=0.3   Area=0.165
+   SectionName=COL   Material=C30   Shape=Rectangular   t3=0.45   t2=0.45   Area=0.2025
+   SectionName=BEAM   Material=C30   Shape=Rectangular   t3=0.55   t2=0.3   Area=0.165
 
 TABLE:  "LINE CONNECTIVITY"
    Line=C1   PointI=1   PointJ=3   SectionName=COL

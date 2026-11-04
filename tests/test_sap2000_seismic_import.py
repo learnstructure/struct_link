@@ -31,6 +31,8 @@ def test_import_sap2000_seismic_model():
     assert len(model.elements) == 26
     assert len(model.supports) == 6
     assert {"DEAD", "Live", "SuperDead", "EQx"}.issubset({lc.id for lc in model.load_cases})
+    # CSI frames are Timoshenko members; the SAP2000 reader must match the ETABS reader
+    assert all(e.include_shear_deformation for e in model.elements)
 
     # 2. Verification of Mass Source
     assert model.mass_source is not None

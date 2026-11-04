@@ -121,6 +121,7 @@ def run(show_plot: bool = False) -> Tuple[Project, Structure]:
             sd1=float(r0.get("Sd1", 0.4)),
             tl=float(r0.get("TL", 8.0)),
             site_class=str(r0.get("SiteClass", "D")),
+            risk_category="II",
             damping_ratio=float(r0.get("FuncDamp", 0.05)),
         )
         t_pts = [float(r["Period"]) for r in t_spec.rows]

@@ -1,6 +1,6 @@
 ; CSI SAP2000 Text File
 TABLE:  "PROGRAM INFORMATION"
-   ProgramName=SAP2000   Version=24.0.0   ProgLevel=Ultimate
+   ProgramName=SAP2000   Version=24.0.0   ProgLevel=Ultimate   CurrUnits="KN, m, C"
 
 TABLE:  "JOINT COORDINATES"
    Joint=1   CoordSys=GLOBAL   CoordType=Cartesian   XorR=0   Y=0   Z=0   SpecialJt=No

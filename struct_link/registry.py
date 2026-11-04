@@ -80,7 +80,11 @@ def get_live_session(software: str) -> BaseLiveSession:
     return cls()
 
 
-def read_model(source: Union[str, Path], software: Optional[str] = None) -> StructuralModel:
+def read_model(
+    source: Union[str, Path],
+    software: Optional[str] = None,
+    allow_partial_import: bool = False,
+) -> StructuralModel:
     """
     Import a model from a commercial software file.
     Auto-detects software from file extension if not provided.
@@ -88,13 +92,14 @@ def read_model(source: Union[str, Path], software: Optional[str] = None) -> Stru
     path = Path(source)
     backend_key = software if software else path.suffix.lower()
     reader = get_reader(backend_key)
-    return reader.read_model(path)
+    return reader.read_model(path, allow_partial_import=allow_partial_import)
 
 
 def read_project(
     source: Union[str, Path],
     software: Optional[str] = None,
     title: Optional[str] = None,
+    allow_partial_import: bool = False,
 ) -> Project:
     """
     Import a Project from a commercial software file.
@@ -103,13 +108,14 @@ def read_project(
     path = Path(source)
     backend_key = software if software else path.suffix.lower()
     reader = get_reader(backend_key)
-    return reader.read_project(path, title=title)
+    return reader.read_project(path, title=title, allow_partial_import=allow_partial_import)
 
 
 def write_model(
     model_or_project: Union[StructuralModel, Project],
     target_path: Union[str, Path],
     software: Optional[str] = None,
+    allow_partial_export: bool = False,
 ) -> Path:
     """
     Export a model to a commercial software file.
@@ -118,5 +124,5 @@ def write_model(
     path = Path(target_path)
     backend_key = software if software else path.suffix.lower()
     writer = get_writer(backend_key)
-    return writer.write_model(model_or_project, path)
+    return writer.write_model(model_or_project, path, allow_partial_export=allow_partial_export)
 

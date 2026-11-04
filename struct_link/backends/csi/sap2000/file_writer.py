@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Union
 from struct_core import Project, StructuralModel, parse_units
 
 from ....base import BaseModelWriter
+from ..materials import _CSI_MATERIAL_TYPES, _concrete_sections
 from ..s2k_parser import S2kWriter
 
 
@@ -23,6 +24,7 @@ class Sap2000FileWriter(BaseModelWriter):
         self,
         model_or_project: Union[StructuralModel, Project],
         target_path: Union[str, Path],
+        allow_partial_export: bool = False,
     ) -> Path:
         model = (
             model_or_project.model
@@ -32,12 +34,34 @@ class Sap2000FileWriter(BaseModelWriter):
         if model is None:
             raise ValueError("Provided project contains no structural model.")
 
+        spring_nodes = [
+            str(s.node_id)
+            for s in getattr(model, "supports", [])
+            if any(getattr(s, k, 0.0) for k in ("kx", "ky", "kz", "krx", "kry", "krz"))
+        ]
+        if spring_nodes and not allow_partial_export:
+            raise ValueError(
+                f"Model contains support springs on nodes {spring_nodes}, which are not supported for export. "
+                f"Use allow_partial_export=True to export without springs."
+            )
+        self.dropped_springs = spring_nodes if allow_partial_export else []
+        self.dropped_items = [f"Support springs on nodes {', '.join(self.dropped_springs)}"] if self.dropped_springs else []
+
         tables: Dict[str, List[Dict[str, Any]]] = {}
 
         # Determine units
-        units_str = "KN, m, C"
+        u = None
         if isinstance(model_or_project, Project) and model_or_project.metadata and model_or_project.metadata.units:
             u = model_or_project.metadata.units
+        elif getattr(model, "units", None):
+            try:
+                u = parse_units(model.units) if isinstance(model.units, str) else model.units
+            except Exception:
+                pass
+        if u is None:
+            raise ValueError("Units unknown: pass units= or use a Project")
+        units_str = "KN, m, C"
+        if u:
             f = (u.force or "").lower()
             l = (u.length or "").lower()
             if "kip" in f and "in" in l:
@@ -88,103 +112,54 @@ class Sap2000FileWriter(BaseModelWriter):
             }
         ]
 
-        # 4. Materials
-        default_mat_id = model.materials[0].id if model.materials else "CONC"
-        materials = model.materials if model.materials else []
-
+        # 4. Materials: the struct_core type gives the CSI type; only the properties the material has are written
+        # (a material without density is written massless). Concrete f'c and rebar Fy / Fu go to tables 03B / 03E.
+        parsed_u = parse_units(units_str)
+        g_acc = parsed_u.gravity_acceleration
         mat_gen_rows = []
         mat_mech_rows = []
-        for m in materials:
+        concrete_rows = []
+        rebar_rows = []
+        for m in model.materials:
             mid = str(m.id)
-            m_name = getattr(m, "name", None) or ""
-            if m_name in ("Concrete", "Steel", "Rebar", "Tendon", "Aluminum", "ColdFormed"):
-                mat_type = m_name
-            elif any(s in mid.upper() for s in ("STEEL", "A992", "A36", "A500", "A53")):
-                mat_type = "Steel"
-            elif any(s in mid.upper() for s in ("REBAR", "A615", "A706")):
-                mat_type = "Rebar"
-            elif any(s in mid.upper() for s in ("TENDON", "A416")):
-                mat_type = "Tendon"
-            elif any(s in mid.upper() for s in ("CONC", "4000PSI", "3000PSI", "5000PSI")):
-                mat_type = "Concrete"
-            else:
-                mat_type = "Steel" if getattr(m, "E", 0) > 1e8 else "Concrete"
-
-            sym_type = "Isotropic" if mat_type in ("Concrete", "Steel", "Aluminum") else "Uniaxial"
-
-            mat_gen_rows.append(
-                {
-                    "Material": mid,
-                    "Type": mat_type,
-                    "SymType": sym_type,
-                    "TempDepend": "No",
-                }
-            )
-
-            parsed_u = parse_units(units_str)
-            g_acc = parsed_u.gravity_acceleration
-
-            E = float(getattr(m, "E", 2.5e7 if mat_type == "Concrete" else 2.0e8))
-            nu = float(getattr(m, "nu", 0.2 if mat_type == "Concrete" else 0.3))
-            G = float(getattr(m, "G", E / (2.0 * (1.0 + nu))))
+            mat_type = _CSI_MATERIAL_TYPES.get(getattr(m, "type", "elastic"), "Other")
+            mat_gen_rows.append({
+                "Material": mid,
+                "Type": mat_type,
+                "SymType": "Uniaxial" if mat_type == "Rebar" else "Isotropic",
+                "TempDepend": "No",
+            })
+            E = float(m.E)
+            nu = float(m.nu)
             unit_wt = getattr(m, "unit_weight", None)
-            if unit_wt is not None and float(unit_wt) > 0.0:
-                unit_wt = float(unit_wt)
-            else:
-                rho_val = getattr(m, "rho", None)
-                if rho_val is not None and float(rho_val) > 0.0:
-                    rho_f = float(rho_val)
-                    if "kn" in units_str.lower():
-                        unit_wt = (rho_f * g_acc) / 1000.0
-                    else:
-                        unit_wt = rho_f * g_acc
-                else:
-                    if mat_type == "Concrete":
-                        unit_wt = 24.0 if "kn" in units_str.lower() else (2400.0 * g_acc)
-                    else:
-                        unit_wt = 76.97 if "kn" in units_str.lower() else (7850.0 * g_acc)
-
-            # In SAP2000, UnitMass is the consistent mass density (Force * s^2 / L^4 = UnitWeight / g)
-            unit_mass = unit_wt / g_acc
-
-            mat_mech_rows.append(
-                {
-                    "Material": mid,
-                    "UnitWeight": unit_wt,
-                    "UnitMass": unit_mass,
-                    "E1": E,
-                    "G12": G,
-                    "U12": nu,
-                    "A1": 0.0,
-                }
-            )
-
-        if not mat_mech_rows:
-            parsed_u = parse_units(units_str)
-            g_acc = parsed_u.gravity_acceleration
-            conc_wt = 24.0 if "kn" in units_str.lower() else (2400.0 * g_acc)
-            conc_mass = conc_wt / g_acc
-            mat_gen_rows.append({"Material": "CONC", "Type": "Concrete", "SymType": "Isotropic", "TempDepend": "No"})
-            mat_mech_rows.append(
-                {
-                    "Material": "CONC",
-                    "UnitWeight": conc_wt,
-                    "UnitMass": conc_mass,
-                    "E1": 2.5e7,
-                    "G12": 1.0416666e7,
-                    "U12": 0.2,
-                    "A1": 0.0,
-                }
-            )
+            if unit_wt is None or float(unit_wt) <= 0.0:
+                rho = float(getattr(m, "rho", 0.0) or 0.0)
+                unit_wt = rho * parsed_u.consistent_mass_factor * g_acc
+            unit_wt = float(unit_wt)
+            row = {"Material": mid, "UnitWeight": unit_wt, "UnitMass": unit_wt / g_acc, "E1": E, "A1": 0.0}
+            if mat_type != "Rebar":
+                row.update({"G12": E / (2.0 * (1.0 + nu)), "U12": nu})
+            mat_mech_rows.append(row)
+            if mat_type == "Concrete":
+                concrete_rows.append({"Material": mid, "Fc": float(m.fc), "eFc": float(m.fc), "LtWtConc": "No"})
+            elif mat_type == "Rebar":
+                rebar_row = {"Material": mid, "Fy": float(m.fy), "EffFy": float(m.fy)}
+                if getattr(m, "fu", None) is not None:
+                    rebar_row.update({"Fu": float(m.fu), "EffFu": float(m.fu)})
+                rebar_rows.append(rebar_row)
 
         tables["MATERIAL PROPERTIES 01 - GENERAL"] = mat_gen_rows
         tables["MATERIAL PROPERTIES 02 - BASIC MECHANICAL PROPERTIES"] = mat_mech_rows
+        if concrete_rows:
+            tables["MATERIAL PROPERTIES 03B - CONCRETE DATA"] = concrete_rows
+        if rebar_rows:
+            tables["MATERIAL PROPERTIES 03E - REBAR DATA"] = rebar_rows
 
         # 5. Frame Section Properties
         sec_rows = []
         for sec in model.sections:
             sec_type = getattr(sec, "type", "general")
-            mat_id = getattr(sec, "material_id", default_mat_id)
+            mat_id = sec.material_id
             if sec_type == "rectangular":
                 b = float(sec.b)
                 h = float(sec.h)
@@ -231,15 +206,15 @@ class Sap2000FileWriter(BaseModelWriter):
                     }
                 )
             else:
-                as2_val = getattr(sec, "As2", getattr(sec, "as2", getattr(sec, "Ay", getattr(sec, "AS2", 0.0))))
-                as3_val = getattr(sec, "As3", getattr(sec, "as3", getattr(sec, "Az", getattr(sec, "AS3", 0.0))))
+                as2_val = getattr(sec, "As2", None)
+                as3_val = getattr(sec, "As3", None)
                 gen_dict = {
                     "SectionName": str(sec.id),
                     "Material": mat_id,
                     "Shape": "General",
                     "Area": float(getattr(sec, "A", 1.0)),
-                    "I33": float(getattr(sec, "Iz", 1.0)),
-                    "I22": float(getattr(sec, "Iy", 1.0)),
+                    "I33": float(getattr(sec, "I3", 1.0)),
+                    "I22": float(getattr(sec, "I2", 1.0)),
                     "J": float(getattr(sec, "J", 1.0)),
                 }
                 if as2_val:
@@ -248,20 +223,26 @@ class Sap2000FileWriter(BaseModelWriter):
                     gen_dict["AS3"] = float(as3_val)
                 sec_rows.append(gen_dict)
 
-        if not sec_rows:
-            sec_rows.append(
-                {
-                    "SectionName": "DEFAULT_SEC",
-                    "Material": default_mat_id,
-                    "Shape": "Rectangular",
-                    "t3": 0.4,
-                    "t2": 0.4,
-                    "Area": 0.16,
-                    "I33": 0.002133,
-                    "I22": 0.002133,
-                }
-            )
         tables["FRAME SECTION PROPERTIES 01 - GENERAL"] = sec_rows
+
+        # Reinforcement of concrete sections: bar materials, and for columns the clear cover to the ties ("Cover").
+        # A beam's TopCover / BotCover is measured to the bar centroid, which needs bar sizes: not written.
+        column_rows, beam_rows = [], []
+        for sec, role in _concrete_sections(model):
+            row = {"SectionName": str(sec.id), "RebarMatL": str(sec.rebar_material_id),
+                   "RebarMatC": str(sec.transverse_rebar_material_id or sec.rebar_material_id)}
+            if role == "column":
+                row.update({"ReinfConfig": "Rectangular" if sec.type == "rectangular" else "Circular",
+                            "LatReinf": "Ties", "ReinfType": "Design"})
+                if sec.cover is not None:
+                    row["Cover"] = float(sec.cover)
+                column_rows.append(row)
+            else:
+                beam_rows.append(row)
+        if column_rows:
+            tables["FRAME SECTION PROPERTIES 02 - CONCRETE COLUMN"] = column_rows
+        if beam_rows:
+            tables["FRAME SECTION PROPERTIES 03 - CONCRETE BEAM"] = beam_rows
 
         # 6. Load Pattern Definitions, Load Case Definitions & Assignments
         pat_rows = []
@@ -344,16 +325,16 @@ class Sap2000FileWriter(BaseModelWriter):
                         else:
                             ct_and_x = "0.016ft, 0.9"
 
-                        r_val = float(sparams.get("r_factor", 8.0))
-                        omega_val = float(sparams.get("omega", 3.0))
-                        cd_val = float(sparams.get("cd", 5.5))
-                        i_val = float(sparams.get("importance_factor", 1.0))
-                        sds_val = float(sparams.get("sds", 1.0))
-                        sd1_val = float(sparams.get("sd1", 0.4))
-                        s1_val = float(sparams.get("s1", 0.35) if sparams.get("s1") is not None else round(sd1_val * 0.875, 4))
-                        tl_val = float(sparams.get("tl", 8.0))
-                        site_class = str(sparams.get("site_class", "D"))
-                        method_type = f"Method {sparams.get('method', 2)}"
+                        r_val = float(sparams.get("r_factor") or 8.0)
+                        omega_val = float(sparams.get("omega") or 3.0)
+                        cd_val = float(sparams.get("cd") or 5.5)
+                        i_val = float(sparams.get("importance_factor") or 1.0)
+                        sds_val = float(sparams.get("sds") or 1.0)
+                        sd1_val = float(sparams.get("sd1") or 0.4)
+                        s1_val = float(sparams.get("s1") if sparams.get("s1") is not None else round(sd1_val * 0.875, 4))
+                        tl_val = float(sparams.get("tl") or 8.0)
+                        site_class = str(sparams.get("site_class") or "D")
+                        method_type = f"Method {sparams.get('method') or 2}"
 
                         hn = max(0.1, max_z - min_z)
                         t_used = float(sparams.get("period_used") or (0.0466 * (hn ** 0.9)))
@@ -364,7 +345,7 @@ class Sap2000FileWriter(BaseModelWriter):
                         auto_seismic_rows.append({
                             "LoadPat": pat,
                             "Dir": dir_val,
-                            "PercentEcc": float(sparams.get("percent_ecc", 0)),
+                            "PercentEcc": float(sparams.get("percent_ecc") or 0.0),
                             "EccOverride": False,
                             "PeriodCalc": "Approximate",
                             "CtAndX": ct_and_x,
@@ -495,6 +476,8 @@ class Sap2000FileWriter(BaseModelWriter):
                         sd1=float(rsa.sd1),
                         tl=float(getattr(rsa, "tl", 8.0) or 8.0),
                         site_class=str(getattr(rsa, "site_class", "D") or "D"),
+                        risk_category=str(getattr(rsa, "risk_category", "II") or "II"),
+                        system_type=str(getattr(rsa, "system_type", "rc_smf") or "rc_smf"),
                         damping_ratio=float(getattr(rsa, "damping_ratio", 0.05)),
                     )
                     break
@@ -525,6 +508,7 @@ class Sap2000FileWriter(BaseModelWriter):
 
         # 7. Joint Coordinates
         coord_rows = []
+        jt_mass_rows = []
         for n in model.nodes:
             coord_rows.append(
                 {
@@ -537,16 +521,29 @@ class Sap2000FileWriter(BaseModelWriter):
                     "SpecialJt": "No",
                 }
             )
+            m = getattr(n, "mass", 0.0)
+            if m and float(m) > 0.0:
+                jt_mass_rows.append({
+                    "Joint": str(n.id),
+                    "U1": float(m),
+                    "U2": float(m),
+                    "U3": float(m),
+                    "R1": 0.0,
+                    "R2": 0.0,
+                    "R3": 0.0,
+                })
         tables["JOINT COORDINATES"] = coord_rows
+        if jt_mass_rows:
+            tables["JOINT ADDED MASS ASSIGNMENTS"] = jt_mass_rows
 
         # 8. Connectivity - Frame & Section Assignments
         conn_rows = []
         sec_assign_rows = []
-        default_sec = model.sections[0].id if model.sections else "DEFAULT_SEC"
 
         node_coords = {str(n.id): n for n in model.nodes}
         local_axes_rows = []
 
+        release_rows = []
         for el in model.elements:
             fid = str(el.id)
             conn_rows.append(
@@ -557,7 +554,7 @@ class Sap2000FileWriter(BaseModelWriter):
                     "IsCurved": "No",
                 }
             )
-            sec_name = str(getattr(el, "section_id", default_sec))
+            sec_name = str(el.section_id) if getattr(el, "section_id", None) is not None else None
             sec_assign_rows.append(
                 {
                     "Frame": fid,
@@ -596,10 +593,54 @@ class Sap2000FileWriter(BaseModelWriter):
                         }
                     )
 
+            # Frame end releases in member local axes [P, V2, V3, T, M2, M3]
+            rel_i = getattr(el, "release_i", None)
+            rel_j = getattr(el, "release_j", None)
+            if (rel_i and any(rel_i)) or (rel_j and any(rel_j)):
+                ri = rel_i or [False] * 6
+                rj = rel_j or [False] * 6
+                release_rows.append(
+                    {
+                        "Frame": fid,
+                        "PI": bool(ri[0]),
+                        "V2I": bool(ri[1]),
+                        "V3I": bool(ri[2]),
+                        "TI": bool(ri[3]),
+                        "M2I": bool(ri[4]),
+                        "M3I": bool(ri[5]),
+                        "PJ": bool(rj[0]),
+                        "V2J": bool(rj[1]),
+                        "V3J": bool(rj[2]),
+                        "TJ": bool(rj[3]),
+                        "M2J": bool(rj[4]),
+                        "M3J": bool(rj[5]),
+                    }
+                )
+
         tables["CONNECTIVITY - FRAME"] = conn_rows
         tables["FRAME SECTION ASSIGNMENTS"] = sec_assign_rows
         if local_axes_rows:
             tables["FRAME LOCAL AXES ASSIGNMENTS 1 - TYPICAL"] = local_axes_rows
+        if release_rows:
+            tables["FRAME RELEASE ASSIGNMENTS 1 - GENERAL"] = release_rows
+
+        prop_mod_rows = []
+        for el in model.elements:
+            mods = getattr(el, "stiffness_modifiers", None)
+            if mods:
+                prop_mod_rows.append({
+                    "Frame": str(el.id),
+                    "A": float(mods.get("A") or 1.0),
+                    "A2": float(mods.get("As2") or mods.get("A2") or 1.0),
+                    "A3": float(mods.get("As3") or mods.get("A3") or 1.0),
+                    "J": float(mods.get("J") or 1.0),
+                    "I2": float(mods.get("I2") or 1.0),
+                    "I3": float(mods.get("I3") or 1.0),
+                    "Mass": float(mods.get("mass") or 1.0),
+                    "Weight": float(mods.get("weight") or 1.0),
+                })
+        if prop_mod_rows:
+            tables["FRAME PROPERTY MODIFIERS"] = prop_mod_rows
 
         # 9. Joint Restraint Assignments
         restr_rows = []
@@ -666,48 +707,95 @@ class Sap2000FileWriter(BaseModelWriter):
                     )
 
             for dl in getattr(lc, "element_loads", []):
-                wz = float(getattr(dl, "wz", 0.0) or 0.0)
-                wy = float(getattr(dl, "wy", 0.0) or 0.0)
-                wx = float(getattr(dl, "wx", 0.0) or 0.0)
+                rel_a = float(getattr(dl, "start", 0.0) or 0.0)
+                rel_b = float(getattr(dl, "end", 1.0) or 1.0)
+                is_loc = getattr(dl, "is_local", False)
 
-                if wz < 0:
-                    dir_str = "Gravity"
-                    val = abs(wz)
-                elif wz > 0:
-                    dir_str = "Z"
-                    val = wz
-                elif wy < 0:
-                    dir_str = "-Y"
-                    val = abs(wy)
-                elif wy > 0:
-                    dir_str = "Y"
-                    val = wy
-                elif wx < 0:
-                    dir_str = "-X"
-                    val = abs(wx)
+                if is_loc:
+                    w1 = float(getattr(dl, "w1", 0.0) or 0.0)
+                    w2 = float(getattr(dl, "w2", 0.0) or 0.0)
+                    w3 = float(getattr(dl, "w3", 0.0) or 0.0)
+                    w1_end = float(getattr(dl, "w1_end", None) if getattr(dl, "w1_end", None) is not None else w1)
+                    w2_end = float(getattr(dl, "w2_end", None) if getattr(dl, "w2_end", None) is not None else w2)
+                    w3_end = float(getattr(dl, "w3_end", None) if getattr(dl, "w3_end", None) is not None else w3)
+                    for dir_str, va, vb in [("1", w1, w1_end), ("2", w2, w2_end), ("3", w3, w3_end)]:
+                        if abs(va) > 1e-12 or abs(vb) > 1e-12:
+                            frm_load_rows.append({
+                                "Frame": str(dl.element_id),
+                                "LoadPat": pat,
+                                "CoordSys": "LOCAL",
+                                "Type": "Force",
+                                "Dir": dir_str,
+                                "DistType": "RelDist",
+                                "RelDistA": rel_a,
+                                "RelDistB": rel_b,
+                                "FOverLA": float(va),
+                                "FOverLB": float(vb),
+                                "FValA": float(va),
+                                "FValB": float(vb),
+                            })
                 else:
-                    dir_str = "X"
-                    val = wx
+                    wz = float(getattr(dl, "wz", 0.0) or 0.0)
+                    wy = float(getattr(dl, "wy", 0.0) or 0.0)
+                    wx = float(getattr(dl, "wx", 0.0) or 0.0)
+                    wz_end = float(getattr(dl, "wz_end", None) if getattr(dl, "wz_end", None) is not None else wz)
+                    wy_end = float(getattr(dl, "wy_end", None) if getattr(dl, "wy_end", None) is not None else wy)
+                    wx_end = float(getattr(dl, "wx_end", None) if getattr(dl, "wx_end", None) is not None else wx)
 
-                val_a = float(getattr(dl, "w_start", None) or val)
-                val_b = float(getattr(dl, "w_end", None) or val)
-
-                frm_load_rows.append(
-                    {
-                        "Frame": str(dl.element_id),
-                        "LoadPat": pat,
-                        "CoordSys": "GLOBAL",
-                        "Type": "Force",
-                        "Dir": dir_str,
-                        "DistType": "RelDist",
-                        "RelDistA": 0.0,
-                        "RelDistB": 1.0,
-                        "FOverLA": float(abs(val_a)),
-                        "FOverLB": float(abs(val_b)),
-                        "FValA": float(abs(val_a)),
-                        "FValB": float(abs(val_b)),
-                    }
-                )
+                    if abs(wz) > 1e-12 or abs(wz_end) > 1e-12:
+                        dir_str = "Gravity" if wz < 0 else "Z"
+                        val_a = abs(wz) if wz < 0 else wz
+                        val_b = abs(wz_end) if wz < 0 else wz_end
+                        frm_load_rows.append({
+                            "Frame": str(dl.element_id),
+                            "LoadPat": pat,
+                            "CoordSys": "GLOBAL",
+                            "Type": "Force",
+                            "Dir": dir_str,
+                            "DistType": "RelDist",
+                            "RelDistA": rel_a,
+                            "RelDistB": rel_b,
+                            "FOverLA": float(val_a),
+                            "FOverLB": float(val_b),
+                            "FValA": float(val_a),
+                            "FValB": float(val_b),
+                        })
+                    if abs(wy) > 1e-12 or abs(wy_end) > 1e-12:
+                        dir_str = "-Y" if wy < 0 else "Y"
+                        val_a = abs(wy) if wy < 0 else wy
+                        val_b = abs(wy_end) if wy < 0 else wy_end
+                        frm_load_rows.append({
+                            "Frame": str(dl.element_id),
+                            "LoadPat": pat,
+                            "CoordSys": "GLOBAL",
+                            "Type": "Force",
+                            "Dir": dir_str,
+                            "DistType": "RelDist",
+                            "RelDistA": rel_a,
+                            "RelDistB": rel_b,
+                            "FOverLA": float(val_a),
+                            "FOverLB": float(val_b),
+                            "FValA": float(val_a),
+                            "FValB": float(val_b),
+                        })
+                    if abs(wx) > 1e-12 or abs(wx_end) > 1e-12:
+                        dir_str = "-X" if wx < 0 else "X"
+                        val_a = abs(wx) if wx < 0 else wx
+                        val_b = abs(wx_end) if wx < 0 else wx_end
+                        frm_load_rows.append({
+                            "Frame": str(dl.element_id),
+                            "LoadPat": pat,
+                            "CoordSys": "GLOBAL",
+                            "Type": "Force",
+                            "Dir": dir_str,
+                            "DistType": "RelDist",
+                            "RelDistA": rel_a,
+                            "RelDistB": rel_b,
+                            "FOverLA": float(val_a),
+                            "FOverLB": float(val_b),
+                            "FValA": float(val_a),
+                            "FValB": float(val_b),
+                        })
 
         if jt_load_rows:
             tables["JOINT LOADS - FORCE"] = jt_load_rows
@@ -715,6 +803,57 @@ class Sap2000FileWriter(BaseModelWriter):
             tables["AUTO SEISMIC LOADS TO JOINTS"] = auto_seismic_joint_rows
         if frm_load_rows:
             tables["FRAME LOADS - DISTRIBUTED"] = frm_load_rows
+
+        frm_pt_rows = []
+        for lc in getattr(model, "load_cases", []):
+            pat = str(lc.id)
+            for epl in getattr(lc, "element_point_loads", []):
+                is_loc = getattr(epl, "is_local", False)
+                csys = "LOCAL" if is_loc else "GLOBAL"
+                pos = float(getattr(epl, "position", 0.0) or 0.0)
+                for comp, dir_name, ltype in [
+                    ("fx", "X" if not is_loc else "1", "Force"),
+                    ("fy", "Y" if not is_loc else "2", "Force"),
+                    ("fz", "Z" if not is_loc else "3", "Force"),
+                    ("mx", "X" if not is_loc else "1", "Moment"),
+                    ("my", "Y" if not is_loc else "2", "Moment"),
+                    ("mz", "Z" if not is_loc else "3", "Moment"),
+                ]:
+                    val = float(getattr(epl, comp, 0.0) or 0.0)
+                    if abs(val) > 1e-12:
+                        actual_dir = dir_name
+                        actual_val = val
+                        if not is_loc and ltype == "Force" and comp == "fz" and val < 0:
+                            actual_dir = "Gravity"
+                            actual_val = abs(val)
+                        elif not is_loc and val < 0:
+                            actual_dir = f"-{dir_name}"
+                            actual_val = abs(val)
+                        frm_pt_rows.append({
+                            "Frame": str(epl.element_id),
+                            "LoadPat": pat,
+                            "CoordSys": csys,
+                            "Type": ltype,
+                            "Dir": actual_dir,
+                            "DistType": "RelDist",
+                            "RelDist": pos,
+                            "PointLoad": actual_val,
+                        })
+        if frm_pt_rows:
+            tables["FRAME LOADS - POINT"] = frm_pt_rows
+
+        comb_rows = []
+        for comb in getattr(model, "load_combinations", []):
+            cname = str(comb.id)
+            for f in getattr(comb, "factors", []):
+                comb_rows.append({
+                    "ComboName": cname,
+                    "CaseName": str(f.load_case_id),
+                    "ScaleFactor": float(f.factor),
+                    "ComboType": "Linear Add",
+                })
+        if comb_rows:
+            tables["COMBINATION DEFINITIONS"] = comb_rows
 
         # 11. Mass Source
         if getattr(model, "mass_source", None):

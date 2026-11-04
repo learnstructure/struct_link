@@ -113,7 +113,7 @@ def test_read_reference_etabs_model():
     )
     assert ref_file.exists(), f"Reference file not found: {ref_file}"
 
-    proj = read_project(ref_file)
+    proj = read_project(ref_file, allow_partial_import=True)
     validate_structural_model(proj.model)
     model = proj.model
 

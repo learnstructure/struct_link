@@ -14,6 +14,8 @@ It bridges commercial structural analysis packages (**CSI SAP2000**, **CSI ETABS
   - **SAP2000**: Full support for `.s2k` and `.$2k` text formats.
   - **ETABS**: Full support for `.e2k` and `.$et` text formats.
   - Ingests nodes, frames, rectangular/circular/general sections, materials, 6-DOF supports, and nodal/distributed loads into `struct_core.StructuralModel`.
+  - **Materials and sections as CSI defines them**: each frame section keeps its own `MATERIAL`; concrete materials with f'c become `ConcreteMaterial` (SAP2000 table `03B - CONCRETE DATA`, ETABS `FC`) and rebar with Fy / Fu `RebarMaterial` (`03E - REBAR DATA`, `FY` / `FU`); concrete sections keep their longitudinal and confinement bar materials and, for columns, the clear cover to the ties (`02 - CONCRETE COLUMN` `Cover`, ETABS `CONCRETESECTION ... COVER`). A beam's cover in CSI is measured to the bar centroid, so beams keep none. Nothing is invented: a property the file lacks stays missing, and the reader's `messages` list it (e.g. a concrete material without f'c). The writers emit the same tables and never write an f'c, density or modulus the model does not have.
+  - Follows CSI defaults: frames are Timoshenko members, and a file without a mass source gets the CSI default (`MSSSRC1`, element self-mass only).
   - Serializes `struct_core.StructuralModel` or `Project` into valid, loadable `.s2k` and `.e2k` files.
 - **Scalable Architecture**:
   - Abstract base classes (`BaseModelReader`, `BaseModelWriter`, `BaseLiveSession`) ensure that new backends (e.g. OpenSees, STAAD, SAFE) plug in without breaking existing workflows.
